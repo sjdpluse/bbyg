@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .features import TickFeatureEngine
 from .labels import CostAwareLabeler
@@ -14,10 +14,11 @@ class ReplayReport:
     feature_rows: int
     labeled: int
     skipped: int
+    extra_cost_spreads: float
 
 
 class TickReplayBuilder:
-    """Build causal training samples from the durable tick journal."""
+    """Build causal samples; only the label builder may inspect future ticks."""
 
     def __init__(self, labeler: CostAwareLabeler | None = None, *, stride: int = 4):
         if stride < 1:
@@ -25,8 +26,13 @@ class TickReplayBuilder:
         self.labeler = labeler or CostAwareLabeler()
         self.stride = stride
 
-    def build(self, store: ScalperStore) -> ReplayReport:
+    def build(self, store: ScalperStore, *, extra_cost_spreads: float | None = None) -> ReplayReport:
         ticks = store.ticks()
+        labeler = self.labeler
+        if extra_cost_spreads is not None:
+            effective = max(labeler.settings.extra_cost_spreads, float(extra_cost_spreads))
+            labeler = CostAwareLabeler(replace(labeler.settings, extra_cost_spreads=effective))
+
         features = TickFeatureEngine()
         snapshots: list[tuple[int, object, tuple[float, ...]]] = []
         for idx, tick in enumerate(ticks):
@@ -36,15 +42,16 @@ class TickReplayBuilder:
 
         labeled = 0
         skipped = 0
-        max_future = self.labeler.settings.max_lookahead_ticks
+        max_future = labeler.settings.max_lookahead_ticks
         for idx, anchor, vector in snapshots:
-            future = ticks[idx + 1 : idx + 1 + max_future]
+            future = ticks[idx + 1:idx + 1 + max_future]
             if len(future) < 10:
                 skipped += 1
                 continue
-            y = self.labeler.label(anchor, future)
+            y = labeler.label(anchor, future)
             if y is None:
                 skipped += 1
                 continue
             labeled += int(store.add_sample(anchor.ts_ns, Sample(vector, y)))
-        return ReplayReport(len(ticks), len(snapshots), labeled, skipped)
+        return ReplayReport(len(ticks), len(snapshots), labeled, skipped,
+                            labeler.settings.extra_cost_spreads)
