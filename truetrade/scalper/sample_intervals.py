@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterable
 
 from .store import ScalperStore
 
@@ -46,17 +47,28 @@ def record_label_interval(
     label_end_ts_ns: int,
     ticks_observed: int,
 ) -> None:
-    interval = SampleLabelInterval(int(feature_ts_ns), int(label_end_ts_ns), int(ticks_observed))
+    record_label_intervals(
+        store,
+        [SampleLabelInterval(int(feature_ts_ns), int(label_end_ts_ns), int(ticks_observed))],
+    )
+
+
+def record_label_intervals(store: ScalperStore, intervals: Iterable[SampleLabelInterval]) -> int:
+    rows = list(intervals)
+    if not rows:
+        return 0
     ensure_label_interval_table(store)
+    payload = [(r.feature_ts_ns, r.label_end_ts_ns, r.ticks_observed) for r in rows]
     with store.db:
-        store.db.execute(
+        store.db.executemany(
             """INSERT INTO sample_label_intervals(feature_ts_ns,label_end_ts_ns,ticks_observed)
                VALUES(?,?,?)
                ON CONFLICT(feature_ts_ns) DO UPDATE SET
                    label_end_ts_ns=excluded.label_end_ts_ns,
                    ticks_observed=excluded.ticks_observed""",
-            (interval.feature_ts_ns, interval.label_end_ts_ns, interval.ticks_observed),
+            payload,
         )
+    return len(payload)
 
 
 def load_label_intervals(store: ScalperStore) -> dict[int, SampleLabelInterval]:
