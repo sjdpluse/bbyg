@@ -66,11 +66,7 @@ class PromotionReport:
 
 
 class ChampionChallenger:
-    """Learning gate: training mutates a challenger, never the serving champion.
-
-    Promotion requires genuinely separate validation samples and improvement in both
-    log-loss and directional accuracy. This prevents uncontrolled online self-modification.
-    """
+    """Learning gate: training mutates a challenger, never the serving champion."""
 
     def __init__(self, dimensions: int = 8):
         self.champion = OnlineLogit(dimensions)
@@ -123,6 +119,31 @@ class ChampionChallenger:
             self.qualified = True
             self.generation += 1
         return PromotionReport(promoted, len(train), len(validation), c_loss, n_loss, c_acc, n_acc)
+
+    def snapshot(self) -> dict:
+        return {
+            "qualified": bool(self.qualified),
+            "generation": int(self.generation),
+            "dimensions": int(len(self.champion.w)),
+            "learning_rate": float(self.champion.lr),
+            "l2": float(self.champion.l2),
+            "weights": [float(x) for x in self.champion.w],
+            "bias": float(self.champion.b),
+        }
+
+    def restore(self, document: dict) -> None:
+        dimensions = int(document["dimensions"])
+        weights = np.asarray(document["weights"], dtype=float)
+        if weights.shape != (dimensions,) or not np.isfinite(weights).all():
+            raise ValueError("invalid model snapshot")
+        model = OnlineLogit(dimensions, float(document["learning_rate"]), float(document["l2"]))
+        model.w = weights.copy()
+        model.b = float(document["bias"])
+        if not math.isfinite(model.b):
+            raise ValueError("invalid model bias")
+        self.champion = model
+        self.qualified = bool(document["qualified"])
+        self.generation = int(document["generation"])
 
     def probability_long(self, features: MicroFeatures) -> float:
         if not self.qualified:
