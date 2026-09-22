@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 
 from .learning import ChampionChallenger, PromotionReport
+from .sample_intervals import load_label_intervals
 from .store import ScalperStore
 
 
@@ -67,10 +68,28 @@ class SelfImprovementController:
         validation_rows = (rows[-cfg.validation_block:] if last_consumed == 0
                            else fresh[: cfg.validation_block])
         validation_start_id = validation_rows[0].sample_id
+        validation_start_ts = validation_rows[0].feature_ts_ns
         train_rows = [r for r in rows if r.sample_id < validation_start_id]
-        if len(train_rows) <= cfg.purge_samples:
-            return LearningCycle(False, "insufficient_pre_validation_history")
-        train_rows = train_rows[: -cfg.purge_samples]
+
+        # Prefer exact label-resolution intervals so no training label is allowed to
+        # inspect a tick at or beyond the validation feature boundary.  The fixed
+        # sample purge remains a compatibility fallback for old/synthetic datasets.
+        intervals = load_label_intervals(self.store)
+        if intervals and all(r.feature_ts_ns in intervals for r in train_rows):
+            before = len(train_rows)
+            train_rows = [
+                r for r in train_rows
+                if intervals[r.feature_ts_ns].label_end_ts_ns < validation_start_ts
+            ]
+            purged = before - len(train_rows)
+            purge_mode = "label_interval"
+        else:
+            if len(train_rows) <= cfg.purge_samples:
+                return LearningCycle(False, "insufficient_pre_validation_history")
+            train_rows = train_rows[: -cfg.purge_samples]
+            purged = cfg.purge_samples
+            purge_mode = "fixed_sample_fallback"
+
         if len(train_rows) < cfg.min_train_samples:
             return LearningCycle(False, "insufficient_training_history")
 
@@ -97,6 +116,8 @@ class SelfImprovementController:
                 "validation_start_id": validation_start_id,
                 "validation_end_id": end_id,
                 "recent_train_samples": len(recent_rows),
+                "purge_mode": purge_mode,
+                "purged_training_samples": purged,
             },
         )
         if report.promoted:
