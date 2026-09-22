@@ -27,11 +27,15 @@ class LabelOutcome:
 
 
 class CostAwareLabeler:
-    """Event-based directional labeler using executable bid/ask prices.
+    """Executable first-passage directional labeler using bid/ask prices.
 
-    max_lookahead_ticks only decides whether a historical sample has enough future
-    evidence. It never creates a time-based trading exit. If neither directional target
-    wins inside the evidence window, the sample remains unlabeled.
+    Each direction is allowed to produce a label only while that hypothetical trade is
+    still alive. If its executable stop is crossed before its target, later recovery to
+    that target cannot relabel the path as a winner. This is essential for short-horizon
+    trading research: a stopped-out trade is not converted into a historical winner by a
+    later price reversal.
+
+    ``max_lookahead_ticks`` limits evidence only; it does not create a time-based exit.
     """
 
     def __init__(self, settings: LabelSettings | None = None):
@@ -45,23 +49,29 @@ class CostAwareLabeler:
         long_entry = anchor.ask
         short_entry = anchor.bid
         long_profit = long_entry + (s.profit_spreads + s.extra_cost_spreads) * spread
-        long_loss = anchor.bid - s.loss_spreads * spread
+        long_stop = anchor.bid - s.loss_spreads * spread
         short_profit = short_entry - (s.profit_spreads + s.extra_cost_spreads) * spread
-        short_loss = anchor.ask + s.loss_spreads * spread
+        short_stop = anchor.ask + s.loss_spreads * spread
 
+        long_alive = True
+        short_alive = True
         for i, tick in enumerate(future[: s.max_lookahead_ticks], start=1):
-            long_win = tick.bid >= long_profit
-            short_win = tick.ask <= short_profit
-            long_fail = tick.bid <= long_loss
-            short_fail = tick.ask >= short_loss
+            long_win = long_alive and tick.bid >= long_profit
+            short_win = short_alive and tick.ask <= short_profit
             if long_win and short_win:
                 return LabelOutcome(None, "ambiguous_simultaneous_profit", i)
-            if long_win and not short_win:
-                return LabelOutcome(1, "long_net_target_first", i)
-            if short_win and not long_win:
-                return LabelOutcome(0, "short_net_target_first", i)
-            if long_fail and short_fail:
-                return LabelOutcome(None, "both_directions_adverse", i)
+            if long_win:
+                return LabelOutcome(1, "long_target_before_stop", i)
+            if short_win:
+                return LabelOutcome(0, "short_target_before_stop", i)
+
+            if long_alive and tick.bid <= long_stop:
+                long_alive = False
+            if short_alive and tick.ask >= short_stop:
+                short_alive = False
+            if not long_alive and not short_alive:
+                return LabelOutcome(None, "both_directions_stopped", i)
+
         return LabelOutcome(None, "unresolved_path", min(len(future), s.max_lookahead_ticks))
 
     def label(self, anchor: Tick, future: list[Tick]) -> int | None:
