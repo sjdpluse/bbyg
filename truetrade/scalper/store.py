@@ -173,12 +173,6 @@ class ScalperStore:
         return int(self.db.execute("SELECT count(*) FROM samples").fetchone()[0])
 
     def reset_learning_state(self) -> None:
-        """Delete only derived learning state while preserving raw ticks and broker evidence.
-
-        Use this after a feature/label definition change. Execution journals, positions and
-        trade outcomes are intentionally untouched. The reset is explicit because it makes
-        prior validation/model state incomparable with newly rebuilt samples.
-        """
         learning_event_kinds = (
             "learning_validation_consumed",
             "learning_cycle",
@@ -343,7 +337,7 @@ class ScalperStore:
             )
         return cur.rowcount == 1
 
-    def trade_outcomes(self, *, model_generation: int | None = None) -> list[dict]:
+    def trade_outcomes(self, model_generation: int | None = None) -> list[dict]:
         sql = """SELECT position_id,decision_id,broker_identifier,model_generation,opened_ns,closed_ns,
                         net_pnl,profit,commission,swap,fee,volume,risk_amount,entry_equity
                  FROM trade_outcomes"""
