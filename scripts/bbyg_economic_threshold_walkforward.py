@@ -95,6 +95,10 @@ def main() -> None:
     parser.add_argument("--linear-iterations", type=int, default=140)
     parser.add_argument("--min-calibration-trades", type=int, default=100)
     parser.add_argument("--min-calibration-profit-factor", type=float, default=1.05)
+    parser.add_argument("--profit-spreads", type=float, default=1.6)
+    parser.add_argument("--loss-spreads", type=float, default=1.4)
+    parser.add_argument("--label-extra-cost-spreads", type=float, default=0.20)
+    parser.add_argument("--stop-reference", choices=("exit_quote", "entry"), default="exit_quote")
     parser.add_argument("--seed", type=int, default=731022)
     args = parser.parse_args()
 
@@ -119,7 +123,12 @@ def main() -> None:
             max_entries_per_second=4, cooldown_ms=0,
         )
         scenario = CostScenario("base_0p20", 0.05, 0.10)
-        label_settings = LabelSettings()
+        label_settings = LabelSettings(
+            profit_spreads=args.profit_spreads,
+            loss_spreads=args.loss_spreads,
+            extra_cost_spreads=args.label_extra_cost_spreads,
+            stop_reference=args.stop_reference,
+        )
         outputs = []
 
         for fold_no, (day, val_start, val_end) in enumerate(eligible, start=1):
@@ -144,9 +153,6 @@ def main() -> None:
             cal_p = p[:len(cal_indices)]
             val_p = p[len(cal_indices):]
 
-            # Replay calibration on its exact historical tick interval. Signals are already
-            # leakage-safe because cal_indices were chosen only from labels resolved before
-            # the validation day, and model training ends before calibration starts.
             cal_tick_ts, cal_bid, cal_ask = _ticks_between(
                 store,
                 int(feature_ts[cal_indices[0]]) - 5_000_000_000,
@@ -267,6 +273,14 @@ def main() -> None:
             "commission_verified": False,
             "state_dir": str(state_dir),
             "model": "linear_raw_balanced",
+            "trade_geometry": {
+                "profit_spreads": label_settings.profit_spreads,
+                "loss_spreads": label_settings.loss_spreads,
+                "label_extra_cost_spreads": label_settings.extra_cost_spreads,
+                "stop_reference": label_settings.stop_reference,
+                "nominal_target_from_entry_spreads": label_settings.nominal_target_from_entry_spreads,
+                "nominal_stop_from_entry_spreads": label_settings.nominal_stop_from_entry_spreads,
+            },
             "cost_scenario": {
                 "name": scenario.name,
                 "total_extra_cost_spreads": scenario.total_extra_cost_spreads,
