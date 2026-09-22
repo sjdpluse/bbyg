@@ -11,6 +11,7 @@ class LabelSettings:
     loss_spreads: float = 1.4
     extra_cost_spreads: float = 0.20
     max_lookahead_ticks: int = 600
+    max_entry_delay_seconds: float = 5.0
     stop_reference: str = "exit_quote"
 
     def __post_init__(self) -> None:
@@ -18,6 +19,8 @@ class LabelSettings:
             raise ValueError("invalid barrier distances")
         if self.max_lookahead_ticks < 10:
             raise ValueError("max_lookahead_ticks too small")
+        if self.max_entry_delay_seconds <= 0:
+            raise ValueError("max_entry_delay_seconds must be positive")
         if self.stop_reference not in {"exit_quote", "entry"}:
             raise ValueError("stop_reference must be 'exit_quote' or 'entry'")
 
@@ -35,8 +38,6 @@ class LabelSettings:
 
     @property
     def nominal_stop_from_entry_spreads(self) -> float:
-        # In exit_quote mode, the entry is one spread beyond the current executable
-        # exit quote, so the actual entry-to-stop risk includes that spread.
         return self.loss_spreads if self.stop_reference == "entry" else self.loss_spreads + 1.0
 
 
@@ -50,6 +51,11 @@ class LabelOutcome:
 class CostAwareLabeler:
     """Executable first-passage directional labeler using bid/ask prices.
 
+    The ``anchor`` passed to :meth:`outcome` is the executable entry quote, not the
+    earlier feature/decision tick. Replay builders are responsible for mapping a causal
+    decision at tick *t* to the first strictly later executable tick before calling this
+    labeler. This keeps offline labels aligned with demo/live order timing.
+
     Each direction is allowed to produce a label only while that hypothetical trade is
     still alive. If its executable stop is crossed before its target, later recovery to
     that target cannot relabel the path as a winner.
@@ -57,9 +63,10 @@ class CostAwareLabeler:
     ``stop_reference='exit_quote'`` preserves the original BBYG research contract, where
     the stop is measured beyond the current executable exit quote. ``'entry'`` is an
     explicit research alternative where ``loss_spreads`` is the actual entry-to-stop
-    distance. The default remains unchanged so historical experiments stay reproducible.
+    distance.
 
-    ``max_lookahead_ticks`` limits evidence only; it does not create a time-based exit.
+    ``max_lookahead_ticks`` counts executable ticks after entry. It limits evidence only;
+    it does not itself create a PnL result for unresolved paths.
     """
 
     def __init__(self, settings: LabelSettings | None = None):
