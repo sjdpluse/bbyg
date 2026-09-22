@@ -63,10 +63,22 @@ class PromotionReport:
     challenger_logloss: float
     champion_accuracy: float
     challenger_accuracy: float
+    champion_balanced_accuracy: float = 0.0
+    challenger_balanced_accuracy: float = 0.0
+    validation_long_fraction: float = 0.5
+    validation_minority_count: int = 0
+    selected_candidate: str = "global"
+    reason: str = "criteria_not_met"
 
 
 class ChampionChallenger:
-    """Learning gate: training mutates a challenger, never the serving champion."""
+    """Learning gate: training mutates challengers, never the serving champion.
+
+    Two challengers may be evaluated on the same untouched chronological block:
+    a long-horizon model trained on all eligible history and a recent-regime model
+    trained only on the most recent eligible history. Only the better challenger may
+    replace the champion, and only after class-aware validation gates pass.
+    """
 
     def __init__(self, dimensions: int = 8):
         self.champion = OnlineLogit(dimensions)
@@ -74,51 +86,120 @@ class ChampionChallenger:
         self.generation = 0
 
     @staticmethod
-    def _metrics(model: OnlineLogit, samples: list[Sample]) -> tuple[float, float]:
+    def _metrics(model: OnlineLogit, samples: list[Sample]) -> tuple[float, float, float]:
         if not samples:
-            return float("inf"), 0.0
-        losses = []
+            return float("inf"), 0.0, 0.0
+        losses: list[float] = []
         correct = 0
+        totals = {0: 0, 1: 0}
+        correct_by_class = {0: 0, 1: 0}
         for s in samples:
             p = min(max(model.probability(s.x), 1e-9), 1 - 1e-9)
             losses.append(-(s.y * math.log(p) + (1 - s.y) * math.log(1 - p)))
-            correct += int((p >= 0.5) == bool(s.y))
-        return float(np.mean(losses)), correct / len(samples)
+            pred = 1 if p >= 0.5 else 0
+            hit = int(pred == s.y)
+            correct += hit
+            totals[s.y] += 1
+            correct_by_class[s.y] += hit
+        recalls = [correct_by_class[y] / totals[y] for y in (0, 1) if totals[y] > 0]
+        balanced = float(np.mean(recalls)) if recalls else 0.0
+        return float(np.mean(losses)), correct / len(samples), balanced
+
+    @staticmethod
+    def _train(base: OnlineLogit, samples: list[Sample], epochs: int) -> OnlineLogit:
+        challenger = base.clone()
+        for _ in range(epochs):
+            for sample in samples:
+                challenger.update(sample)
+        return challenger
 
     def fit_and_maybe_promote(
         self,
         train: list[Sample],
         validation: list[Sample],
         *,
+        recent_train: list[Sample] | None = None,
         epochs: int = 4,
         min_train: int = 200,
         min_validation: int = 100,
         min_logloss_improvement: float = 0.01,
         min_accuracy: float = 0.53,
+        min_balanced_accuracy: float = 0.52,
+        min_validation_class_count: int = 20,
     ) -> PromotionReport:
         if set(map(id, train)) & set(map(id, validation)):
             raise ValueError("train and validation objects must be disjoint")
+        if recent_train is not None and set(map(id, recent_train)) & set(map(id, validation)):
+            raise ValueError("recent train and validation objects must be disjoint")
         if len(train) < min_train or len(validation) < min_validation:
             raise ValueError("insufficient independent learning data")
-        challenger = self.champion.clone()
-        for _ in range(epochs):
-            for s in train:
-                challenger.update(s)
+        if min_validation_class_count < 1:
+            raise ValueError("minimum validation class count must be positive")
 
-        c_loss, c_acc = self._metrics(self.champion, validation)
-        n_loss, n_acc = self._metrics(challenger, validation)
+        global_candidate = self._train(self.champion, train, epochs)
+        candidates: list[tuple[str, OnlineLogit]] = [("global", global_candidate)]
+        if recent_train is not None and len(recent_train) >= min_train:
+            candidates.append(("recent", self._train(self.champion, recent_train, epochs)))
+
+        c_loss, c_acc, c_bal = self._metrics(self.champion, validation)
+        evaluated: list[tuple[str, OnlineLogit, float, float, float]] = []
+        for name, model in candidates:
+            loss, acc, bal = self._metrics(model, validation)
+            evaluated.append((name, model, loss, acc, bal))
+        name, challenger, n_loss, n_acc, n_bal = min(
+            evaluated,
+            key=lambda item: (item[2], -item[4], -item[3]),
+        )
+
+        positives = sum(s.y for s in validation)
+        negatives = len(validation) - positives
+        minority = min(positives, negatives)
+        long_fraction = positives / len(validation)
+        class_usable = minority >= min_validation_class_count
         improve = c_loss - n_loss
         promoted = (
-            math.isfinite(n_loss)
+            class_usable
+            and math.isfinite(n_loss)
             and improve >= min_logloss_improvement
             and n_acc >= min_accuracy
-            and n_acc >= c_acc
+            and n_bal >= min_balanced_accuracy
+            and n_bal >= c_bal
         )
+
+        if not class_usable:
+            reason = "validation_class_imbalance"
+        elif promoted:
+            reason = "promoted"
+        elif not math.isfinite(n_loss):
+            reason = "non_finite_challenger"
+        elif improve < min_logloss_improvement:
+            reason = "logloss_not_improved"
+        elif n_bal < min_balanced_accuracy or n_bal < c_bal:
+            reason = "balanced_accuracy_not_improved"
+        elif n_acc < min_accuracy:
+            reason = "accuracy_below_floor"
+        else:
+            reason = "criteria_not_met"
+
         if promoted:
             self.champion = challenger
             self.qualified = True
             self.generation += 1
-        return PromotionReport(promoted, len(train), len(validation), c_loss, n_loss, c_acc, n_acc)
+        return PromotionReport(
+            promoted=promoted,
+            train_samples=len(train),
+            validation_samples=len(validation),
+            champion_logloss=c_loss,
+            challenger_logloss=n_loss,
+            champion_accuracy=c_acc,
+            challenger_accuracy=n_acc,
+            champion_balanced_accuracy=c_bal,
+            challenger_balanced_accuracy=n_bal,
+            validation_long_fraction=long_fraction,
+            validation_minority_count=minority,
+            selected_candidate=name,
+            reason=reason,
+        )
 
     def snapshot(self) -> dict:
         return {
