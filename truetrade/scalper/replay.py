@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from .features import TickFeatureEngine
 from .labels import CostAwareLabeler
 from .learning import Sample
+from .sample_intervals import clear_label_intervals, record_label_interval
 from .store import ScalperStore
 
 
@@ -33,6 +34,10 @@ class TickReplayBuilder:
             effective = max(labeler.settings.extra_cost_spreads, float(extra_cost_spreads))
             labeler = CostAwareLabeler(replace(labeler.settings, extra_cost_spreads=effective))
 
+        # A replay defines the complete derived sample set for the current tick history.
+        # Keep interval evidence in sync with that derived state.
+        clear_label_intervals(store)
+
         features = TickFeatureEngine()
         snapshots: list[tuple[int, object, tuple[float, ...]]] = []
         for idx, tick in enumerate(ticks):
@@ -48,10 +53,22 @@ class TickReplayBuilder:
             if len(future) < 10:
                 skipped += 1
                 continue
-            y = labeler.label(anchor, future)
-            if y is None:
+            outcome = labeler.outcome(anchor, future)
+            if outcome.label is None:
                 skipped += 1
                 continue
-            labeled += int(store.add_sample(anchor.ts_ns, Sample(vector, y)))
+            label_end_idx = idx + outcome.ticks_observed
+            if label_end_idx >= len(ticks):
+                skipped += 1
+                continue
+            inserted = store.add_sample(anchor.ts_ns, Sample(vector, outcome.label))
+            if inserted:
+                record_label_interval(
+                    store,
+                    anchor.ts_ns,
+                    ticks[label_end_idx].ts_ns,
+                    outcome.ticks_observed,
+                )
+                labeled += 1
         return ReplayReport(len(ticks), len(snapshots), labeled, skipped,
                             labeler.settings.extra_cost_spreads)
