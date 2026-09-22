@@ -36,6 +36,38 @@ def _status_only(store: ScalperStore) -> None:
     )
 
 
+def _rebuild_learning(store: ScalperStore) -> None:
+    started = time.perf_counter()
+    tick_count = len(store.ticks())
+    if tick_count < 1_000:
+        raise SystemExit("not enough stored ticks to rebuild learning")
+    _print("resetting_learning_state", stored_ticks=tick_count)
+    store.reset_learning_state()
+    _print("building_replay", stored_ticks=tick_count)
+    replay = TickReplayBuilder().build(store)
+    _print("replay_complete", labeled=replay.labeled, skipped=replay.skipped, samples=store.sample_count())
+
+    learner = ChampionChallenger()
+    controller = SelfImprovementController(store, learner)
+    _print("training_check")
+    cycle = controller.maybe_train()
+    _print(
+        "complete",
+        mode="rebuild_learning_only",
+        stored_ticks=tick_count,
+        samples=store.sample_count(),
+        replay=asdict(replay),
+        learning={
+            "attempted": cycle.attempted,
+            "reason": cycle.reason,
+            "generation": learner.generation,
+            "qualified": learner.qualified,
+            "report": None if cycle.report is None else asdict(cycle.report),
+        },
+        elapsed_seconds=round(time.perf_counter() - started, 3),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Import recent MT5 DEMO ticks into BBYG and run one replay/training cycle"
@@ -43,7 +75,14 @@ def main() -> None:
     parser.add_argument("--hours", type=float, default=6.0, help="broker-history window; default 6h")
     parser.add_argument("--max-ticks", type=int, default=250_000, help="hard cap for imported ticks")
     parser.add_argument("--status-only", action="store_true", help="print durable bootstrap/learning state without importing or training")
+    parser.add_argument(
+        "--rebuild-learning-only",
+        action="store_true",
+        help="reset derived learning state and rebuild it from already stored ticks; no MT5 history download",
+    )
     args = parser.parse_args()
+    if args.status_only and args.rebuild_learning_only:
+        raise SystemExit("choose only one of --status-only or --rebuild-learning-only")
     if not 0 < args.hours <= 168:
         raise SystemExit("--hours must be in (0, 168]")
     if not 1_000 <= args.max_ticks <= 2_000_000:
@@ -55,6 +94,12 @@ def main() -> None:
     if args.status_only:
         try:
             _status_only(store)
+        finally:
+            store.close()
+        return
+    if args.rebuild_learning_only:
+        try:
+            _rebuild_learning(store)
         finally:
             store.close()
         return
