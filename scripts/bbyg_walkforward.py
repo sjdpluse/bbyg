@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 from pathlib import Path
 
 import numpy as np
 
+from truetrade.scalper.sample_intervals import load_label_intervals
 from truetrade.scalper.store import ScalperStore
 
 
@@ -123,7 +123,7 @@ def main() -> None:
     )
     parser.add_argument("--folds", type=int, default=6)
     parser.add_argument("--validation", type=int, default=1000)
-    parser.add_argument("--purge", type=int, default=40)
+    parser.add_argument("--purge", type=int, default=40, help="fallback only when label intervals are unavailable")
     parser.add_argument("--min-train", type=int, default=10000)
     parser.add_argument("--iterations", type=int, default=120)
     parser.add_argument("--learning-rate", type=float, default=0.08)
@@ -136,6 +136,7 @@ def main() -> None:
     store = ScalperStore(state_dir / "scalper.sqlite")
     try:
         rows = store.samples()
+        intervals = load_label_intervals(store)
     finally:
         store.close()
     if len(rows) < args.min_train + args.purge + args.validation * args.folds:
@@ -144,6 +145,8 @@ def main() -> None:
     x = np.asarray([r.sample.x for r in rows], dtype=float)
     y = np.asarray([r.sample.y for r in rows], dtype=int)
     n = len(rows)
+    interval_coverage = sum(r.feature_ts_ns in intervals for r in rows) / n if n else 0.0
+    use_intervals = interval_coverage >= 0.999
 
     earliest = args.min_train + args.purge
     latest = n - args.validation
@@ -161,10 +164,29 @@ def main() -> None:
     aggregate: dict[str, list[dict]] = {name: [] for name in candidates}
 
     for fold_no, val_start in enumerate(starts, start=1):
-        train_end = int(val_start) - args.purge
-        val_end = int(val_start) + args.validation
-        train_x = x[:train_end]
-        train_y = y[:train_end]
+        val_start = int(val_start)
+        val_end = val_start + args.validation
+        validation_start_ts = rows[val_start].feature_ts_ns
+        if use_intervals:
+            eligible_indices = [
+                i for i in range(val_start)
+                if intervals[rows[i].feature_ts_ns].label_end_ts_ns < validation_start_ts
+            ]
+            if len(eligible_indices) < args.min_train:
+                raise SystemExit(f"fold {fold_no}: insufficient leakage-safe training samples")
+            train_indices = np.asarray(eligible_indices, dtype=int)
+            purge_mode = "label_interval"
+            purged = val_start - len(eligible_indices)
+        else:
+            train_end = val_start - args.purge
+            if train_end < args.min_train:
+                raise SystemExit(f"fold {fold_no}: insufficient fallback training samples")
+            train_indices = np.arange(train_end, dtype=int)
+            purge_mode = "fixed_sample_fallback"
+            purged = args.purge
+
+        train_x = x[train_indices]
+        train_y = y[train_indices]
         val_x = x[val_start:val_end]
         val_y = y[val_start:val_end]
 
@@ -173,9 +195,11 @@ def main() -> None:
         baseline = _metrics(val_y, baseline_p)
         result = {
             "fold": fold_no,
-            "train_end_sample_id": int(rows[train_end - 1].sample_id),
+            "train_end_sample_id": int(rows[int(train_indices[-1])].sample_id),
             "validation_start_sample_id": int(rows[val_start].sample_id),
             "validation_end_sample_id": int(rows[val_end - 1].sample_id),
+            "purge_mode": purge_mode,
+            "purged_training_samples": int(purged),
             "baseline": baseline,
             "candidates": {},
         }
@@ -218,6 +242,8 @@ def main() -> None:
     print(json.dumps({
         "mode": "read_only_walk_forward",
         "samples": n,
+        "label_interval_coverage": interval_coverage,
+        "purge_mode": "label_interval" if use_intervals else "fixed_sample_fallback",
         "settings": {
             "folds": len(starts),
             "validation": args.validation,
