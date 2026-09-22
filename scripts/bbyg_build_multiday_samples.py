@@ -22,6 +22,7 @@ def main() -> None:
     parser.add_argument("--loss-spreads", type=float, default=1.4)
     parser.add_argument("--extra-cost-spreads", type=float, default=0.20)
     parser.add_argument("--max-lookahead-ticks", type=int, default=600)
+    parser.add_argument("--max-entry-delay-seconds", type=float, default=5.0)
     parser.add_argument("--stop-reference", choices=("exit_quote", "entry"), default="exit_quote")
     args = parser.parse_args()
 
@@ -41,6 +42,7 @@ def main() -> None:
             loss_spreads=args.loss_spreads,
             extra_cost_spreads=args.extra_cost_spreads,
             max_lookahead_ticks=args.max_lookahead_ticks,
+            max_entry_delay_seconds=args.max_entry_delay_seconds,
             stop_reference=args.stop_reference,
         )
         _print(
@@ -52,6 +54,7 @@ def main() -> None:
                 "loss_spreads": settings.loss_spreads,
                 "extra_cost_spreads": settings.extra_cost_spreads,
                 "max_lookahead_ticks": settings.max_lookahead_ticks,
+                "max_entry_delay_seconds": settings.max_entry_delay_seconds,
                 "stop_reference": settings.stop_reference,
                 "nominal_target_from_entry_spreads": settings.nominal_target_from_entry_spreads,
                 "nominal_stop_from_entry_spreads": settings.nominal_stop_from_entry_spreads,
