@@ -38,6 +38,32 @@ def sigmoid(z: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(z, -30.0, 30.0)))
 
 
+def _logit(p: np.ndarray | float) -> np.ndarray:
+    a = np.asarray(p, dtype=float)
+    a = np.clip(a, EPS, 1.0 - EPS)
+    return np.log(a / (1.0 - a))
+
+
+def restore_training_prior(probabilities: np.ndarray, train_y: np.ndarray) -> np.ndarray:
+    """Undo the artificial 50/50 class prior introduced by balanced sample weights.
+
+    Balanced cross-entropy estimates posterior odds under an equalized class prior.
+    For probability-sensitive metrics and trading decisions, convert those odds back to
+    the causal class prior observed in the training window. This uses training labels
+    only; validation/holdout labels are never consulted.
+    """
+    p = np.asarray(probabilities, dtype=float)
+    y = np.asarray(train_y, dtype=float)
+    if p.ndim != 1 or y.ndim != 1 or len(y) == 0 or not np.isfinite(p).all():
+        raise ValueError("finite probabilities and training labels required")
+    if not np.isin(y, (0.0, 1.0)).all():
+        raise ValueError("binary labels required")
+    prior = float(np.clip(np.mean(y), EPS, 1.0 - EPS))
+    # Equalized training has prior 0.5, whose log-odds are zero. Therefore adding the
+    # observed training-prior log-odds is the exact prior-odds correction.
+    return sigmoid(_logit(p) + float(_logit(prior)))
+
+
 def quadratic_expand(x: np.ndarray) -> np.ndarray:
     """Return original standardized features plus all x_i*x_j interactions for i<=j."""
     x = np.asarray(x, dtype=float)
@@ -244,6 +270,7 @@ def fit_predict_architecture(
     linear_iterations: int = 160,
     mlp_iterations: int = 180,
     seed: int = 731022,
+    restore_prior: bool = False,
 ) -> np.ndarray:
     scaler = RobustScaler.fit(train_x)
     tx = scaler.transform(train_x)
@@ -251,14 +278,17 @@ def fit_predict_architecture(
 
     if architecture == "linear":
         model = fit_logit(tx, train_y, iterations=linear_iterations, balanced=True)
-        return model.probability(vx)
-    if architecture == "quadratic":
+        p = model.probability(vx)
+    elif architecture == "quadratic":
         qtx = quadratic_expand(tx)
         qvx = quadratic_expand(vx)
         model = fit_logit(qtx, train_y, iterations=linear_iterations, learning_rate=0.035,
                           l2=2e-3, balanced=True)
-        return model.probability(qvx)
-    if architecture == "mlp":
+        p = model.probability(qvx)
+    elif architecture == "mlp":
         model = fit_mlp(tx, train_y, iterations=mlp_iterations, seed=seed)
-        return model.probability(vx)
-    raise ValueError(f"unknown research architecture: {architecture}")
+        p = model.probability(vx)
+    else:
+        raise ValueError(f"unknown research architecture: {architecture}")
+
+    return restore_training_prior(p, train_y) if restore_prior else p
