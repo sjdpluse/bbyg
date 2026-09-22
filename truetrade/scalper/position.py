@@ -14,12 +14,18 @@ class ExitSettings:
     reduce_edge_below: float = 0.08
     keep_edge_above: float = 0.14
     reduce_fraction: float = 0.5
+    scale_profit_spreads: float = 3.0
+    scale_edge_below: float = 0.20
+    scale_fraction: float = 0.25
+    max_reductions: int = 2
 
     def __post_init__(self) -> None:
         if self.hard_stop_spreads <= 0 or self.profit_lock_activation_spreads <= 0 or self.trail_backoff_spreads <= 0:
             raise ValueError("distance settings must be positive")
-        if not 0 < self.reduce_fraction < 1:
-            raise ValueError("reduce_fraction must be between zero and one")
+        if not 0 < self.reduce_fraction < 1 or not 0 < self.scale_fraction < 1:
+            raise ValueError("reduction fractions must be between zero and one")
+        if self.max_reductions < 1:
+            raise ValueError("max_reductions must be positive")
 
 
 class AlgorithmicExitManager:
@@ -32,13 +38,8 @@ class AlgorithmicExitManager:
     def _exit_price(position: PositionState, tick: Tick) -> float:
         return tick.bid if position.side is Side.LONG else tick.ask
 
-    def evaluate(
-        self,
-        position: PositionState,
-        tick: Tick,
-        features: MicroFeatures,
-        probability_long: float,
-    ) -> Intent:
+    def evaluate(self, position: PositionState, tick: Tick, features: MicroFeatures,
+                 probability_long: float) -> Intent:
         s = self.settings
         side_sign = position.side.sign
         exit_price = self._exit_price(position, tick)
@@ -72,14 +73,28 @@ class AlgorithmicExitManager:
         activated = favorable / spread >= s.profit_lock_activation_spreads
         trailed = giveback / spread >= s.trail_backoff_spreads
         if activated and trailed and directional_edge < s.keep_edge_above:
-            return Intent(IntentKind.CLOSE, "algorithmic_profit_lock", position_id=position.position_id,
+            return Intent(IntentKind.CLOSE, "algorithmic_profit_lock",
+                          position_id=position.position_id,
                           confidence=min(1.0, max(0.0, pnl_spreads / 4.0)))
 
-        weakening = directional_edge < s.reduce_edge_below and (momentum <= 0 or trend <= 0)
-        if pnl_spreads > 0 and weakening and position.reductions == 0:
+        scale_condition = (
+            pnl_spreads >= s.scale_profit_spreads
+            and directional_edge < s.scale_edge_below
+            and (momentum <= max(0.0, features.slow_velocity * side_sign) or imbalance < 0.10)
+            and position.reductions < s.max_reductions
+        )
+        if scale_condition:
             position.reductions += 1
-            return Intent(IntentKind.REDUCE, "edge_decay_partial", position_id=position.position_id,
-                          fraction=s.reduce_fraction, confidence=min(1.0, max(0.0, pnl_spreads / 3.0)))
+            return Intent(IntentKind.REDUCE, "profit_scale_on_edge_decay",
+                          position_id=position.position_id, fraction=s.scale_fraction,
+                          confidence=min(1.0, max(0.0, pnl_spreads / 5.0)))
+
+        weakening = directional_edge < s.reduce_edge_below and (momentum <= 0 or trend <= 0)
+        if pnl_spreads > 0 and weakening and position.reductions < s.max_reductions:
+            position.reductions += 1
+            return Intent(IntentKind.REDUCE, "edge_decay_partial",
+                          position_id=position.position_id, fraction=s.reduce_fraction,
+                          confidence=min(1.0, max(0.0, pnl_spreads / 3.0)))
 
         return Intent(IntentKind.HOLD, "edge_intact", position_id=position.position_id,
                       confidence=min(1.0, max(0.0, directional_edge)))
