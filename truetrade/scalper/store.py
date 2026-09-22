@@ -175,6 +175,12 @@ class ScalperStore:
         with self.db:
             self.db.execute("DELETE FROM samples")
             self.db.execute("DELETE FROM sqlite_sequence WHERE name='samples'")
+            # The interval table is introduced lazily by the replay subsystem.
+            exists = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sample_label_intervals'"
+            ).fetchone()
+            if exists:
+                self.db.execute("DELETE FROM sample_label_intervals")
             self.db.execute(
                 "DELETE FROM meta WHERE key IN (?, ?)",
                 ("scalper_last_validation_sample_id", "scalper_champion_snapshot"),
