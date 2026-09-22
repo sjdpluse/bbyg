@@ -6,9 +6,10 @@ import os
 from pathlib import Path
 import time
 
-from truetrade.scalper.execution import DemoMT5Execution, DemoMT5Settings
+from truetrade.scalper.execution import DemoMT5Settings
 from truetrade.scalper.runtime import DemoScalperRuntime, RuntimeSettings
 from truetrade.scalper.store import ScalperStore
+from truetrade.scalper.timebase import BrokerTimebase, TimeNormalizedDemoMT5Execution
 
 
 def main() -> None:
@@ -19,7 +20,8 @@ def main() -> None:
     state_dir = Path(os.getenv("BBYG_STATE_DIR", "data/bbyg-demo"))
     state_dir.mkdir(parents=True, exist_ok=True)
     store = ScalperStore(state_dir / "scalper.sqlite")
-    broker = DemoMT5Execution(DemoMT5Settings.from_env())
+    timebase = BrokerTimebase.from_env()
+    broker = TimeNormalizedDemoMT5Execution(DemoMT5Settings.from_env(), timebase=timebase)
     runtime = DemoScalperRuntime(broker, store, settings=RuntimeSettings.from_env())
 
     try:
@@ -29,6 +31,7 @@ def main() -> None:
             "mode": "demo",
             "symbol": broker.symbol,
             "execution_enabled": runtime.settings.execution_enabled,
+            "server_utc_offset_seconds": timebase.utc_offset_seconds,
             "reconciliation": reconciliation,
         }, sort_keys=True))
         if args.once:
