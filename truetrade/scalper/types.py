@@ -19,6 +19,7 @@ class IntentKind(str, Enum):
     ADD = "ADD"
     REDUCE = "REDUCE"
     CLOSE = "CLOSE"
+    PROTECT = "PROTECT"
     HOLD = "HOLD"
 
 
@@ -87,6 +88,7 @@ class PositionState:
     peak_exit_price: float | None = None
     trough_exit_price: float | None = None
     reductions: int = 0
+    broker_stop: float | None = None
 
     def __post_init__(self) -> None:
         if not self.position_id:
@@ -95,6 +97,8 @@ class PositionState:
             raise ValueError("position size must be positive and finite")
         if self.entry <= 0 or not math.isfinite(self.entry):
             raise ValueError("entry must be positive and finite")
+        if self.broker_stop is not None and (self.broker_stop <= 0 or not math.isfinite(self.broker_stop)):
+            raise ValueError("broker stop must be positive and finite")
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,7 @@ class Intent:
     fraction: float = 1.0
     confidence: float = 0.0
     size: float | None = None
+    stop: float | None = None
 
     def __post_init__(self) -> None:
         if not 0 < self.fraction <= 1:
@@ -114,3 +119,7 @@ class Intent:
             raise ValueError("confidence must be in [0, 1]")
         if self.size is not None and (self.size <= 0 or not math.isfinite(self.size)):
             raise ValueError("size must be positive and finite")
+        if self.stop is not None and (self.stop <= 0 or not math.isfinite(self.stop)):
+            raise ValueError("stop must be positive and finite")
+        if self.kind is IntentKind.PROTECT and (self.position_id is None or self.stop is None):
+            raise ValueError("protection intent requires position and stop")
