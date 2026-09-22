@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -22,6 +23,8 @@ def _print(stage: str, **fields) -> None:
 
 def _status_only(store: ScalperStore) -> None:
     model = store.meta(SelfImprovementController.META_MODEL)
+    events = store.events("learning_validation_consumed")
+    last_learning = None if not events else events[-1]["payload"]
     _print(
         "status",
         stored_ticks=len(store.ticks()),
@@ -29,6 +32,7 @@ def _status_only(store: ScalperStore) -> None:
         last_validation_sample_id=int(store.meta(SelfImprovementController.META_LAST_VALIDATION, 0) or 0),
         model_generation=0 if not model else int(model.get("generation", 0)),
         model_qualified=False if not model else bool(model.get("qualified", False)),
+        last_learning=last_learning,
     )
 
 
@@ -103,18 +107,7 @@ def main() -> None:
         _print("training_check")
         cycle = controller.maybe_train()
 
-        report = None
-        if cycle.report is not None:
-            report = {
-                "promoted": cycle.report.promoted,
-                "train_samples": cycle.report.train_samples,
-                "validation_samples": cycle.report.validation_samples,
-                "champion_logloss": cycle.report.champion_logloss,
-                "challenger_logloss": cycle.report.challenger_logloss,
-                "champion_accuracy": cycle.report.champion_accuracy,
-                "challenger_accuracy": cycle.report.challenger_accuracy,
-            }
-
+        report = None if cycle.report is None else asdict(cycle.report)
         print(json.dumps({
             "stage": "complete",
             "symbol": broker.symbol,
