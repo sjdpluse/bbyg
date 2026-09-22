@@ -11,12 +11,33 @@ class LabelSettings:
     loss_spreads: float = 1.4
     extra_cost_spreads: float = 0.20
     max_lookahead_ticks: int = 600
+    stop_reference: str = "exit_quote"
 
     def __post_init__(self) -> None:
         if self.profit_spreads <= 0 or self.loss_spreads <= 0 or self.extra_cost_spreads < 0:
             raise ValueError("invalid barrier distances")
         if self.max_lookahead_ticks < 10:
             raise ValueError("max_lookahead_ticks too small")
+        if self.stop_reference not in {"exit_quote", "entry"}:
+            raise ValueError("stop_reference must be 'exit_quote' or 'entry'")
+
+    def long_stop_price(self, bid, ask, spread):
+        base = ask if self.stop_reference == "entry" else bid
+        return base - self.loss_spreads * spread
+
+    def short_stop_price(self, bid, ask, spread):
+        base = bid if self.stop_reference == "entry" else ask
+        return base + self.loss_spreads * spread
+
+    @property
+    def nominal_target_from_entry_spreads(self) -> float:
+        return self.profit_spreads + self.extra_cost_spreads
+
+    @property
+    def nominal_stop_from_entry_spreads(self) -> float:
+        # In exit_quote mode, the entry is one spread beyond the current executable
+        # exit quote, so the actual entry-to-stop risk includes that spread.
+        return self.loss_spreads if self.stop_reference == "entry" else self.loss_spreads + 1.0
 
 
 @dataclass(frozen=True)
@@ -31,9 +52,12 @@ class CostAwareLabeler:
 
     Each direction is allowed to produce a label only while that hypothetical trade is
     still alive. If its executable stop is crossed before its target, later recovery to
-    that target cannot relabel the path as a winner. This is essential for short-horizon
-    trading research: a stopped-out trade is not converted into a historical winner by a
-    later price reversal.
+    that target cannot relabel the path as a winner.
+
+    ``stop_reference='exit_quote'`` preserves the original BBYG research contract, where
+    the stop is measured beyond the current executable exit quote. ``'entry'`` is an
+    explicit research alternative where ``loss_spreads`` is the actual entry-to-stop
+    distance. The default remains unchanged so historical experiments stay reproducible.
 
     ``max_lookahead_ticks`` limits evidence only; it does not create a time-based exit.
     """
@@ -49,9 +73,9 @@ class CostAwareLabeler:
         long_entry = anchor.ask
         short_entry = anchor.bid
         long_profit = long_entry + (s.profit_spreads + s.extra_cost_spreads) * spread
-        long_stop = anchor.bid - s.loss_spreads * spread
+        long_stop = s.long_stop_price(anchor.bid, anchor.ask, spread)
         short_profit = short_entry - (s.profit_spreads + s.extra_cost_spreads) * spread
-        short_stop = anchor.ask + s.loss_spreads * spread
+        short_stop = s.short_stop_price(anchor.bid, anchor.ask, spread)
 
         long_alive = True
         short_alive = True
