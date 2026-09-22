@@ -68,6 +68,33 @@ class EconomicReplayTests(unittest.TestCase):
         self.assertEqual(trades[0].exit_reason, "stop")
         self.assertLess(trades[0].gross_pnl_spreads, 0.0)
 
+    def test_entry_relative_stop_is_actual_entry_risk(self):
+        settings = LabelSettings(
+            profit_spreads=1.6,
+            loss_spreads=1.4,
+            extra_cost_spreads=0.2,
+            max_lookahead_ticks=20,
+            stop_reference="entry",
+        )
+        spread = 0.2
+        self.assertAlmostEqual(settings.long_stop_price(100.0, 100.2, spread), 99.92)
+        self.assertAlmostEqual(settings.short_stop_price(100.0, 100.2, spread), 100.28)
+        self.assertAlmostEqual(settings.nominal_target_from_entry_spreads, 1.8)
+        self.assertAlmostEqual(settings.nominal_stop_from_entry_spreads, 1.4)
+
+    def test_legacy_exit_quote_stop_keeps_original_effective_risk(self):
+        settings = LabelSettings(
+            profit_spreads=1.6,
+            loss_spreads=1.4,
+            extra_cost_spreads=0.2,
+            max_lookahead_ticks=20,
+            stop_reference="exit_quote",
+        )
+        spread = 0.2
+        self.assertAlmostEqual(settings.long_stop_price(100.0, 100.2, spread), 99.72)
+        self.assertAlmostEqual(settings.short_stop_price(100.0, 100.2, spread), 100.48)
+        self.assertAlmostEqual(settings.nominal_stop_from_entry_spreads, 2.4)
+
     def test_cost_scenarios_reduce_same_gross_trade_deterministically(self):
         ts = np.asarray([1, 2, 3, 4], dtype=np.int64) * 1_000_000_000
         bid = np.asarray([100.0, 100.0, 100.5, 100.5])
