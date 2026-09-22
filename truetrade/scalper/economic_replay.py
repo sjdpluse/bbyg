@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import deque
-import math
 
 import numpy as np
 
@@ -51,7 +50,7 @@ class OpenTrade:
     signal_ts_ns: int
     entry_index: int
     entry_ts_ns: int
-    side: int  # +1 long, -1 short
+    side: int
     confidence: float
     entry: float
     entry_spread: float
@@ -111,10 +110,9 @@ def simulate_selective_trades(
     """Replay selective signals against executable bid/ask ticks.
 
     A signal observed at a sample timestamp can enter only on the next tick. Targets and
-    stops are built from that next executable quote using the same first-passage contract
-    as the stop-aware historical labels. Favorable target overshoot is not credited;
-    adverse stop gaps are. Positions are flattened before a >max_gap market gap and at the
-    end of the supplied validation slice.
+    stops use the exact same LabelSettings geometry as the historical label builder.
+    Favorable target overshoot is not credited; adverse stop gaps are preserved. Positions
+    are flattened before a >max_gap market gap and at the end of the supplied slice.
     """
     ts = np.asarray(tick_ts, dtype=np.int64)
     bid = np.asarray(bid, dtype=float)
@@ -139,7 +137,6 @@ def simulate_selective_trades(
     selected_p = probability_long[selected]
     selected_conf = confidence[selected]
 
-    # Map each causal decision to the first strictly later tick.
     entry_indices = np.searchsorted(ts, selected_ts, side="right")
     valid = entry_indices < len(ts)
     delay_ns = np.zeros(len(entry_indices), dtype=np.int64)
@@ -176,9 +173,6 @@ def simulate_selective_trades(
 
     for i in range(len(ts)):
         now = int(ts[i])
-
-        # A long exits on bid; a short exits on ask. Stop checks take precedence because
-        # a gap can jump past both the old target region and the stop region between ticks.
         survivors: list[OpenTrade] = []
         for position in open_positions:
             if position.side > 0:
@@ -202,7 +196,6 @@ def simulate_selective_trades(
             survivors.append(position)
         open_positions = survivors
 
-        # Flatten before a market closure/gap, using the last executable quote before it.
         if i + 1 < len(ts) and int(ts[i + 1] - ts[i]) > gap_ns:
             for position in open_positions:
                 exit_price = float(bid[i] if position.side > 0 else ask[i])
@@ -236,12 +229,12 @@ def simulate_selective_trades(
             spread = max(float(ask[i] - bid[i]), 1e-12)
             if side > 0:
                 entry = float(ask[i])
-                target = entry + (settings.profit_spreads + settings.extra_cost_spreads) * spread
-                stop = float(bid[i]) - settings.loss_spreads * spread
+                target = entry + settings.nominal_target_from_entry_spreads * spread
+                stop = float(settings.long_stop_price(bid[i], ask[i], spread))
             else:
                 entry = float(bid[i])
-                target = entry - (settings.profit_spreads + settings.extra_cost_spreads) * spread
-                stop = float(ask[i]) + settings.loss_spreads * spread
+                target = entry - settings.nominal_target_from_entry_spreads * spread
+                stop = float(settings.short_stop_price(bid[i], ask[i], spread))
             open_positions.append(OpenTrade(
                 trade_id=int(trade_id),
                 signal_ts_ns=int(sig_ts),
