@@ -21,7 +21,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Collect multi-day MT5 DEMO history into BBYG in safe chunks")
     parser.add_argument("--days", type=float, default=7.0, help="calendar days of broker history to request")
     parser.add_argument("--chunk-hours", type=float, default=3.0, help="request window size; default 3h")
-    parser.add_argument("--max-total-ticks", type=int, default=3_000_000, help="hard safety cap")
+    parser.add_argument("--max-total-ticks", type=int, default=5_000_000, help="hard safety cap")
     args = parser.parse_args()
     if not 0 < args.days <= 30:
         raise SystemExit("--days must be in (0, 30]")
@@ -101,8 +101,10 @@ def main() -> None:
             if total_inserted >= args.max_total_ticks:
                 raise SystemExit(f"hard tick cap reached at {total_inserted}; increase --max-total-ticks deliberately")
 
-            # Make broker request windows non-overlapping at millisecond precision.
-            cursor = end + timedelta(milliseconds=1)
+            # copy_ticks_range is inclusive at broker boundaries. Reusing the exact
+            # boundary avoids any 1ms hole; INSERT OR IGNORE makes the repeated boundary
+            # deterministic and harmless.
+            cursor = end
 
         first_iso = None
         last_iso = None
