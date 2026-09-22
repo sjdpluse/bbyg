@@ -18,78 +18,87 @@ class StopAwareLabelTests(unittest.TestCase):
 
     def test_later_recovery_after_long_stop_is_not_long_winner(self):
         anchor = Tick(1, 100.0, 100.2)
-        # Long stop is 99.8 and long target is 100.4 executable bid.  The long
-        # hypothesis stops first, then price later rallies through its old target.
-        path = [
-            Tick(2, 99.7, 99.9),
-            Tick(3, 100.5, 100.7),
-        ]
+        path = [Tick(2, 99.7, 99.9), Tick(3, 100.5, 100.7)]
         outcome = self.labeler.outcome(anchor, path)
         self.assertNotEqual(outcome.label, 1)
 
     def test_later_recovery_after_short_stop_is_not_short_winner(self):
         anchor = Tick(1, 100.0, 100.2)
-        # Short stop is 100.4 and short target is 99.8 executable ask.
-        path = [
-            Tick(2, 100.5, 100.7),
-            Tick(3, 99.5, 99.7),
-        ]
+        path = [Tick(2, 100.5, 100.7), Tick(3, 99.5, 99.7)]
         outcome = self.labeler.outcome(anchor, path)
         self.assertNotEqual(outcome.label, 0)
 
-    def test_fast_first_passage_decision_matches_scalar_for_known_paths(self):
+    def test_entry_relative_stop_reports_actual_entry_risk(self):
+        settings = LabelSettings(
+            profit_spreads=1.6,
+            loss_spreads=1.4,
+            extra_cost_spreads=0.2,
+            stop_reference="entry",
+        )
+        self.assertAlmostEqual(settings.nominal_target_from_entry_spreads, 1.8)
+        self.assertAlmostEqual(settings.nominal_stop_from_entry_spreads, 1.4)
+        spread = 0.2
+        self.assertAlmostEqual(settings.long_stop_price(100.0, 100.2, spread), 99.92)
+        self.assertAlmostEqual(settings.short_stop_price(100.0, 100.2, spread), 100.28)
+
+    def test_fast_labels_enter_on_first_tick_after_decision(self):
         settings = LabelSettings(
             profit_spreads=1.0,
             loss_spreads=1.0,
             extra_cost_spreads=0.0,
             max_lookahead_ticks=10,
+            stop_reference="entry",
         )
-        labeler = CostAwareLabeler(settings)
-        builder = FastGapAwareReplayBuilder(labeler=labeler, stride=1)
+        builder = FastGapAwareReplayBuilder(labeler=CostAwareLabeler(settings), stride=1)
 
-        # Include 96 warm-up ticks, then three anchor trajectories. We call the
-        # vectorized label helper directly so this test is about label semantics only.
-        # The replay contract requires at least 10 future ticks at an anchor, so add a
-        # flat tail after the three trajectories rather than testing an end-of-stream
-        # insufficiency at the same time.
-        bid = [99.9] * 96
-        ask = [100.1] * 96
-        ts = list(range(1, 97))
-
-        # Anchor A: long target before its stop -> LONG.
-        bid += [100.0, 100.5, 100.5, 100.5]
-        ask += [100.2, 100.7, 100.7, 100.7]
-        ts += list(range(97, 101))
-        # Anchor B: short target before its stop -> SHORT.
-        bid += [100.0, 99.5, 99.5, 99.5]
-        ask += [100.2, 99.7, 99.7, 99.7]
-        ts += list(range(101, 105))
-        # Anchor C: long stops, then its old target is reached; must not label LONG.
-        bid += [100.0, 99.7, 100.5, 100.5]
-        ask += [100.2, 99.9, 100.7, 100.7]
-        ts += list(range(105, 109))
-        # Sufficient trailing evidence for all three anchors.
-        bid += [100.0] * 10
-        ask += [100.2] * 10
-        ts += list(range(109, 119))
-
-        ts_arr = np.asarray(ts, dtype=np.int64)
+        # 96 warm-up ticks, then a feature/decision tick at index 96. Index 97 is the
+        # executable entry and index 98 reaches the long target. If index 96 were used as
+        # the entry, the recorded interval would be one tick shorter.
+        bid = [99.9] * 96 + [100.0, 100.1, 100.5] + [100.5] * 10
+        ask = [100.1] * 96 + [100.2, 100.3, 100.7] + [100.7] * 10
+        ts = np.arange(1, len(bid) + 1, dtype=np.int64) * 1_000_000
         bid_arr = np.asarray(bid, dtype=float)
         ask_arr = np.asarray(ask, dtype=float)
-        anchors = np.asarray([96, 100, 104], dtype=np.int64)
-        vectors = np.zeros((3, 8), dtype=float)
-        samples, _intervals, _skipped, _long, _short = builder._label_batch(
-            anchors,
-            vectors,
-            ts_arr,
-            bid_arr,
-            ask_arr,
+        anchors = np.asarray([96], dtype=np.int64)
+        vectors = np.zeros((1, 8), dtype=float)
+
+        samples, intervals, skipped, long_count, short_count = builder._label_batch(
+            anchors, vectors, ts, bid_arr, ask_arr, np.empty(0, dtype=np.int64)
+        )
+        self.assertEqual(skipped, 0)
+        self.assertEqual(long_count, 1)
+        self.assertEqual(short_count, 0)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0][1].y, 1)
+        self.assertEqual(intervals[0].feature_ts_ns, int(ts[96]))
+        self.assertEqual(intervals[0].label_end_ts_ns, int(ts[98]))
+        self.assertEqual(intervals[0].ticks_observed, 2)
+
+    def test_slow_next_tick_is_not_executable_entry(self):
+        settings = LabelSettings(
+            profit_spreads=1.0,
+            loss_spreads=1.0,
+            extra_cost_spreads=0.0,
+            max_lookahead_ticks=10,
+            max_entry_delay_seconds=0.5,
+            stop_reference="entry",
+        )
+        builder = FastGapAwareReplayBuilder(labeler=CostAwareLabeler(settings), stride=1)
+        bid = np.asarray([99.9] * 110, dtype=float)
+        ask = np.asarray([100.1] * 110, dtype=float)
+        ts = np.arange(110, dtype=np.int64) * 10_000_000
+        ts[97:] += 1_000_000_000  # decision at 96 -> next tick delayed > 0.5s
+        samples, intervals, skipped, _long, _short = builder._label_batch(
+            np.asarray([96], dtype=np.int64),
+            np.zeros((1, 8), dtype=float),
+            ts,
+            bid,
+            ask,
             np.empty(0, dtype=np.int64),
         )
-        labels = {feature_ts: sample.y for feature_ts, sample in samples}
-        self.assertEqual(labels.get(int(ts_arr[96])), 1)
-        self.assertEqual(labels.get(int(ts_arr[100])), 0)
-        self.assertNotEqual(labels.get(int(ts_arr[104])), 1)
+        self.assertEqual(samples, [])
+        self.assertEqual(intervals, [])
+        self.assertEqual(skipped, 1)
 
 
 if __name__ == "__main__":
