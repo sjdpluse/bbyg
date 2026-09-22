@@ -159,6 +159,35 @@ class ScalperStore:
     def sample_count(self) -> int:
         return int(self.db.execute("SELECT count(*) FROM samples").fetchone()[0])
 
+    def reset_learning_state(self) -> None:
+        """Delete only derived learning state while preserving raw ticks and broker evidence.
+
+        Use this after a feature/label definition change. Execution journals, positions and
+        trade outcomes are intentionally untouched. The reset is explicit because it makes
+        prior validation/model state incomparable with newly rebuilt samples.
+        """
+        learning_event_kinds = (
+            "learning_validation_consumed",
+            "learning_cycle",
+            "model_promoted",
+            "forward_qualification_updated",
+        )
+        with self.db:
+            self.db.execute("DELETE FROM samples")
+            self.db.execute("DELETE FROM sqlite_sequence WHERE name='samples'")
+            self.db.execute(
+                "DELETE FROM meta WHERE key IN (?, ?)",
+                ("scalper_last_validation_sample_id", "scalper_champion_snapshot"),
+            )
+            placeholders = ",".join("?" for _ in learning_event_kinds)
+            self.db.execute(
+                f"DELETE FROM events WHERE kind IN ({placeholders})",
+                learning_event_kinds,
+            )
+            self.db.execute(
+                "DELETE FROM meta WHERE key LIKE 'scalper_forward_qualification_generation_%'"
+            )
+
     def replace_positions(self, positions: Iterable[PositionState]) -> None:
         rows = list(positions)
         with self.db:
@@ -227,115 +256,96 @@ class ScalperStore:
                                     broker_identifier: int | None = None,
                                     risk_amount: float | None = None,
                                     detail: str | None = None) -> None:
-        allowed = {"created", "submitted", "confirmed", "rejected", "unknown"}
-        if state not in allowed:
-            raise ValueError("invalid execution intent state")
-        row = self.db.execute(
-            "SELECT state,detail FROM execution_intents WHERE decision_id=?", (decision_id,)
-        ).fetchone()
-        if row is None:
+        if state not in {"created", "submitted", "confirmed", "rejected", "unknown"}:
+            raise ValueError("invalid execution state")
+        current = self.execution_intent(decision_id)
+        if current is None:
             raise KeyError(decision_id)
-        current, current_detail = row
-        transitions = {
-            "created": {"submitted", "rejected", "unknown"},
+        allowed = {
+            "created": {"submitted", "rejected"},
             "submitted": {"confirmed", "rejected", "unknown"},
-            "unknown": {"confirmed", "rejected", "unknown"},
+            "unknown": {"confirmed", "rejected"},
             "confirmed": set(),
             "rejected": set(),
         }
-        if state != current and state not in transitions[current]:
-            raise ValueError(f"invalid execution transition {current}->{state}")
+        if state != current["state"] and state not in allowed[current["state"]]:
+            raise ValueError("invalid execution transition")
         with self.db:
             self.db.execute(
                 """UPDATE execution_intents
-                   SET state=?, broker_position_id=COALESCE(?,broker_position_id),
+                   SET state=?,broker_position_id=COALESCE(?,broker_position_id),
                        broker_identifier=COALESCE(?,broker_identifier),
-                       risk_amount=COALESCE(?,risk_amount), detail=?
+                       risk_amount=COALESCE(?,risk_amount),detail=COALESCE(?,detail)
                    WHERE decision_id=?""",
-                (state, broker_position_id, broker_identifier, risk_amount,
-                 current_detail if detail is None else detail, decision_id),
+                (state, broker_position_id, broker_identifier, risk_amount, detail, decision_id),
             )
-
-    @staticmethod
-    def _intent_keys() -> tuple[str, ...]:
-        return (
-            "decision_id", "created_ns", "kind", "position_id", "side", "size", "fraction",
-            "stop", "state", "broker_position_id", "broker_identifier", "model_generation",
-            "entry_equity", "risk_amount", "detail",
-        )
-
-    def _intent_select(self) -> str:
-        return ",".join(self._intent_keys())
-
-    def unsettled_execution_intents(self) -> list[dict]:
-        rows = self.db.execute(
-            f"""SELECT {self._intent_select()} FROM execution_intents
-                WHERE state IN ('created','submitted','unknown') ORDER BY created_ns"""
-        ).fetchall()
-        keys = self._intent_keys()
-        return [dict(zip(keys, row)) for row in rows]
 
     def execution_intent(self, decision_id: str) -> dict | None:
         row = self.db.execute(
-            f"SELECT {self._intent_select()} FROM execution_intents WHERE decision_id=?", (decision_id,)
+            """SELECT decision_id,created_ns,kind,position_id,side,size,fraction,stop,state,
+                      broker_position_id,broker_identifier,model_generation,entry_equity,risk_amount,detail
+               FROM execution_intents WHERE decision_id=?""",
+            (decision_id,),
         ).fetchone()
-        return None if row is None else dict(zip(self._intent_keys(), row))
+        if row is None:
+            return None
+        keys = ("decision_id", "created_ns", "kind", "position_id", "side", "size", "fraction", "stop",
+                "state", "broker_position_id", "broker_identifier", "model_generation", "entry_equity",
+                "risk_amount", "detail")
+        return dict(zip(keys, row))
+
+    def unsettled_execution_intents(self) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT decision_id FROM execution_intents WHERE state IN ('created','submitted','unknown') ORDER BY created_ns"
+        ).fetchall()
+        return [self.execution_intent(str(row[0])) for row in rows]
 
     def confirmed_entry_intents_without_outcome(self) -> list[dict]:
         rows = self.db.execute(
-            f"""SELECT {self._intent_select()} FROM execution_intents i
-                WHERE i.kind IN ('OPEN','ADD') AND i.state='confirmed'
-                  AND i.broker_position_id IS NOT NULL AND i.broker_identifier IS NOT NULL
-                  AND NOT EXISTS (SELECT 1 FROM trade_outcomes o WHERE o.decision_id=i.decision_id)
-                ORDER BY i.created_ns"""
+            """SELECT decision_id FROM execution_intents e
+               WHERE e.state='confirmed' AND e.kind IN ('OPEN','ADD')
+                 AND NOT EXISTS(SELECT 1 FROM trade_outcomes t WHERE t.decision_id=e.decision_id)
+               ORDER BY e.created_ns"""
         ).fetchall()
-        return [dict(zip(self._intent_keys(), row)) for row in rows]
+        return [self.execution_intent(str(row[0])) for row in rows]
 
-    def record_trade_outcome(self, record: dict) -> bool:
-        required = (
-            "position_id", "decision_id", "broker_identifier", "model_generation", "opened_ns",
-            "closed_ns", "net_pnl", "profit", "commission", "swap", "fee", "volume",
-            "risk_amount", "entry_equity",
+    def record_trade_outcome(self, outcome: dict) -> bool:
+        fields = (
+            "position_id", "decision_id", "broker_identifier", "model_generation", "opened_ns", "closed_ns",
+            "net_pnl", "profit", "commission", "swap", "fee", "volume", "risk_amount", "entry_equity",
         )
-        if any(k not in record for k in required):
-            raise ValueError("incomplete trade outcome")
+        values = tuple(outcome[k] for k in fields)
         with self.db:
             cur = self.db.execute(
                 """INSERT OR IGNORE INTO trade_outcomes(
                        position_id,decision_id,broker_identifier,model_generation,opened_ns,closed_ns,
                        net_pnl,profit,commission,swap,fee,volume,risk_amount,entry_equity
                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                tuple(record[k] for k in required),
+                values,
             )
         return cur.rowcount == 1
 
-    def trade_outcomes(self, model_generation: int | None = None) -> list[dict]:
-        keys = (
-            "position_id", "decision_id", "broker_identifier", "model_generation", "opened_ns",
-            "closed_ns", "net_pnl", "profit", "commission", "swap", "fee", "volume",
-            "risk_amount", "entry_equity",
-        )
-        if model_generation is None:
-            rows = self.db.execute(
-                f"SELECT {','.join(keys)} FROM trade_outcomes ORDER BY closed_ns,position_id"
-            ).fetchall()
-        else:
-            rows = self.db.execute(
-                f"SELECT {','.join(keys)} FROM trade_outcomes WHERE model_generation=? ORDER BY closed_ns,position_id",
-                (int(model_generation),),
-            ).fetchall()
-        return [dict(zip(keys, row)) for row in rows]
-
-    def set_meta(self, key: str, value) -> None:
-        if not key:
-            raise ValueError("meta key required")
-        encoded = json.dumps(value, separators=(",", ":"), allow_nan=False)
-        with self.db:
-            self.db.execute(
-                "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, encoded),
-            )
+    def trade_outcomes(self, *, model_generation: int | None = None) -> list[dict]:
+        sql = """SELECT position_id,decision_id,broker_identifier,model_generation,opened_ns,closed_ns,
+                        net_pnl,profit,commission,swap,fee,volume,risk_amount,entry_equity
+                 FROM trade_outcomes"""
+        args: tuple[object, ...] = ()
+        if model_generation is not None:
+            sql += " WHERE model_generation=?"
+            args = (int(model_generation),)
+        sql += " ORDER BY closed_ns,position_id"
+        keys = ("position_id", "decision_id", "broker_identifier", "model_generation", "opened_ns", "closed_ns",
+                "net_pnl", "profit", "commission", "swap", "fee", "volume", "risk_amount", "entry_equity")
+        return [dict(zip(keys, row)) for row in self.db.execute(sql, args).fetchall()]
 
     def meta(self, key: str, default=None):
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return default if row is None else json.loads(row[0])
+
+    def set_meta(self, key: str, value) -> None:
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self.db:
+            self.db.execute(
+                "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, payload),
+            )
