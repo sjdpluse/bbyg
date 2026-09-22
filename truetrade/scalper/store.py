@@ -142,13 +142,26 @@ class ScalperStore:
         return int(row[0] or 0)
 
     def add_sample(self, feature_ts_ns: int, sample: Sample) -> bool:
-        payload = json.dumps(list(sample.x), separators=(",", ":"), allow_nan=False)
-        with self.db:
-            cur = self.db.execute(
-                "INSERT OR IGNORE INTO samples(feature_ts_ns,x_json,y) VALUES(?,?,?)",
-                (int(feature_ts_ns), payload, int(sample.y)),
+        return self.add_samples([(int(feature_ts_ns), sample)]) == 1
+
+    def add_samples(self, rows: Iterable[tuple[int, Sample]]) -> int:
+        payload = [
+            (
+                int(feature_ts_ns),
+                json.dumps(list(sample.x), separators=(",", ":"), allow_nan=False),
+                int(sample.y),
             )
-        return cur.rowcount == 1
+            for feature_ts_ns, sample in rows
+        ]
+        if not payload:
+            return 0
+        before = self.db.total_changes
+        with self.db:
+            self.db.executemany(
+                "INSERT OR IGNORE INTO samples(feature_ts_ns,x_json,y) VALUES(?,?,?)",
+                payload,
+            )
+        return int(self.db.total_changes - before)
 
     def samples(self, *, after_id: int = 0) -> list[StoredSample]:
         rows = self.db.execute(
@@ -175,7 +188,6 @@ class ScalperStore:
         with self.db:
             self.db.execute("DELETE FROM samples")
             self.db.execute("DELETE FROM sqlite_sequence WHERE name='samples'")
-            # The interval table is introduced lazily by the replay subsystem.
             exists = self.db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sample_label_intervals'"
             ).fetchone()
