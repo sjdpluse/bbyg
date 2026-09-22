@@ -105,9 +105,12 @@ class Intent:
     position_id: str | None = None
     fraction: float = 1.0
     confidence: float = 0.0
+    size: float | None = None
 
     def __post_init__(self) -> None:
         if not 0 < self.fraction <= 1:
             raise ValueError("fraction must be in (0, 1]")
         if not 0 <= self.confidence <= 1:
             raise ValueError("confidence must be in [0, 1]")
+        if self.size is not None and (self.size <= 0 or not math.isfinite(self.size)):
+            raise ValueError("size must be positive and finite")
