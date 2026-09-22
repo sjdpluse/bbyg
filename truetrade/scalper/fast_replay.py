@@ -22,6 +22,9 @@ class FastReplayReport:
     max_gap_seconds: float
     stride: int
     extra_cost_spreads: float
+    stop_reference: str
+    nominal_target_from_entry_spreads: float
+    nominal_stop_from_entry_spreads: float
 
 
 class FastGapAwareReplayBuilder:
@@ -194,9 +197,9 @@ class FastGapAwareReplayBuilder:
 
         spread = np.maximum(ask[a] - bid[a], 1e-12)
         long_profit = ask[a] + (s.profit_spreads + s.extra_cost_spreads) * spread
-        long_stop = bid[a] - s.loss_spreads * spread
+        long_stop = s.long_stop_price(bid[a], ask[a], spread)
         short_profit = bid[a] - (s.profit_spreads + s.extra_cost_spreads) * spread
-        short_stop = ask[a] + s.loss_spreads * spread
+        short_stop = s.short_stop_price(bid[a], ask[a], spread)
 
         first_long_target = self._first_true(fb >= long_profit[:, None], valid)
         first_long_stop = self._first_true(fb <= long_stop[:, None], valid)
@@ -286,4 +289,7 @@ class FastGapAwareReplayBuilder:
             max_gap_seconds=self.max_gap_seconds,
             stride=self.stride,
             extra_cost_spreads=self.labeler.settings.extra_cost_spreads,
+            stop_reference=self.labeler.settings.stop_reference,
+            nominal_target_from_entry_spreads=self.labeler.settings.nominal_target_from_entry_spreads,
+            nominal_stop_from_entry_spreads=self.labeler.settings.nominal_stop_from_entry_spreads,
         )
