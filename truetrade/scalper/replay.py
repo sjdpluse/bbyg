@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from .features import TickFeatureEngine
 from .labels import CostAwareLabeler
 from .learning import Sample
-from .sample_intervals import clear_label_intervals, record_label_interval
+from .sample_intervals import SampleLabelInterval, clear_label_intervals, record_label_intervals
 from .store import ScalperStore
 
 
@@ -34,8 +34,6 @@ class TickReplayBuilder:
             effective = max(labeler.settings.extra_cost_spreads, float(extra_cost_spreads))
             labeler = CostAwareLabeler(replace(labeler.settings, extra_cost_spreads=effective))
 
-        # A replay defines the complete derived sample set for the current tick history.
-        # Keep interval evidence in sync with that derived state.
         clear_label_intervals(store)
 
         features = TickFeatureEngine()
@@ -45,7 +43,8 @@ class TickReplayBuilder:
             if f is not None and idx % self.stride == 0:
                 snapshots.append((idx, tick, f.vector()))
 
-        labeled = 0
+        sample_rows: list[tuple[int, Sample]] = []
+        interval_rows: list[SampleLabelInterval] = []
         skipped = 0
         max_future = labeler.settings.max_lookahead_ticks
         for idx, anchor, vector in snapshots:
@@ -61,14 +60,18 @@ class TickReplayBuilder:
             if label_end_idx >= len(ticks):
                 skipped += 1
                 continue
-            inserted = store.add_sample(anchor.ts_ns, Sample(vector, outcome.label))
-            if inserted:
-                record_label_interval(
-                    store,
-                    anchor.ts_ns,
-                    ticks[label_end_idx].ts_ns,
-                    outcome.ticks_observed,
-                )
-                labeled += 1
+            sample_rows.append((anchor.ts_ns, Sample(vector, outcome.label)))
+            interval_rows.append(
+                SampleLabelInterval(anchor.ts_ns, ticks[label_end_idx].ts_ns, outcome.ticks_observed)
+            )
+
+        labeled = store.add_samples(sample_rows)
+        # The replay is normally run after a learning reset. In case pre-existing samples
+        # caused INSERT OR IGNORE collisions, only persist intervals for timestamps that
+        # are now present in the sample table.
+        if interval_rows:
+            present = {r.feature_ts_ns for r in store.samples()}
+            record_label_intervals(store, [r for r in interval_rows if r.feature_ts_ns in present])
+
         return ReplayReport(len(ticks), len(snapshots), labeled, skipped,
                             labeler.settings.extra_cost_spreads)
