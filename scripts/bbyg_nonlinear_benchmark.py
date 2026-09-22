@@ -7,7 +7,11 @@ from pathlib import Path
 
 import numpy as np
 
-from truetrade.scalper.research_models import binary_metrics, fit_predict_architecture
+from truetrade.scalper.research_models import (
+    binary_metrics,
+    fit_predict_architecture,
+    restore_training_prior,
+)
 from truetrade.scalper.sample_intervals import load_label_intervals
 from truetrade.scalper.store import ScalperStore
 
@@ -32,22 +36,12 @@ def _first_feasible_validation_start(
     latest_possible_start: int,
     min_train: int,
 ) -> int | None:
-    """Find the earliest validation boundary with enough fully resolved labels.
-
-    ``min_train`` is a requirement on leakage-safe *eligible* rows, not merely on the
-    numeric validation index. A few labels immediately before a boundary can still be
-    resolving into the validation period, so starting exactly at ``min_train`` may leave
-    fewer than ``min_train`` usable observations. Advance only as far as necessary.
-    """
     start = max(int(preferred_start), int(min_train))
     latest = int(latest_possible_start)
     while start <= latest:
         eligible = _eligible_train_indices(rows, intervals, start)
         if len(eligible) >= min_train:
             return start
-        # At least one new row becomes part of the historical prefix each step. Jump by
-        # the current deficit to avoid repeatedly scanning almost-identical prefixes;
-        # any still-unresolved labels are checked again at the new boundary.
         start += max(1, min_train - len(eligible))
     return None
 
@@ -64,14 +58,14 @@ def _evaluate_candidate(
     linear_iterations: int,
     mlp_iterations: int,
     seed: int,
-) -> dict:
+) -> tuple[dict, dict]:
     if recent > 0 and len(train_indices) > recent:
         train_indices = train_indices[-recent:]
     train_x = x[train_indices]
     train_y = y[train_indices]
     val_x = x[val_start:val_end]
     val_y = y[val_start:val_end]
-    p = fit_predict_architecture(
+    raw_p = fit_predict_architecture(
         architecture,
         train_x,
         train_y,
@@ -79,11 +73,15 @@ def _evaluate_candidate(
         linear_iterations=linear_iterations,
         mlp_iterations=mlp_iterations,
         seed=seed,
+        restore_prior=False,
     )
-    metrics = binary_metrics(val_y, p)
-    metrics["train_samples"] = int(len(train_indices))
-    metrics["train_long_fraction"] = float(np.mean(train_y))
-    return metrics
+    corrected_p = restore_training_prior(raw_p, train_y)
+    raw = binary_metrics(val_y, raw_p)
+    corrected = binary_metrics(val_y, corrected_p)
+    for metrics in (raw, corrected):
+        metrics["train_samples"] = int(len(train_indices))
+        metrics["train_long_fraction"] = float(np.mean(train_y))
+    return raw, corrected
 
 
 def _baseline(y_train: np.ndarray, y_val: np.ndarray) -> dict:
@@ -135,9 +133,7 @@ def _passes_research_gate(summary: dict, latest: dict) -> tuple[bool, list[str]]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Read-only leakage-safe nonlinear benchmark for BBYG tick learning"
-    )
+    parser = argparse.ArgumentParser(description="Read-only leakage-safe nonlinear benchmark for BBYG tick learning")
     parser.add_argument("--folds", type=int, default=6)
     parser.add_argument("--validation", type=int, default=1000)
     parser.add_argument("--latest-validation", type=int, default=120)
@@ -172,25 +168,18 @@ def main() -> None:
     if latest_start <= args.min_train:
         raise SystemExit("not enough samples for latest independent holdout")
 
-    # The walk-forward folds end before the final independent latest block so that the
-    # same newest evidence is not used for architecture selection and final confirmation.
     latest_fold_start = latest_start - args.validation
     if latest_fold_start <= args.min_train:
         raise SystemExit("not enough samples for requested folds and final holdout")
-    earliest_fold_start = _first_feasible_validation_start(
-        rows,
-        intervals,
-        args.min_train,
-        latest_fold_start,
-        args.min_train,
-    )
+    earliest_fold_start = _first_feasible_validation_start(rows, intervals, args.min_train, latest_fold_start, args.min_train)
     if earliest_fold_start is None:
         raise SystemExit("no leakage-safe fold has enough training samples")
     starts = np.unique(np.linspace(earliest_fold_start, latest_fold_start, args.folds, dtype=int))
     if len(starts) < args.folds:
         raise SystemExit("not enough distinct chronological folds")
 
-    aggregate: dict[str, list[dict]] = {a: [] for a in ARCHITECTURES}
+    aggregate_raw: dict[str, list[dict]] = {a: [] for a in ARCHITECTURES}
+    aggregate_corrected: dict[str, list[dict]] = {a: [] for a in ARCHITECTURES}
     folds: list[dict] = []
     for fold_no, val_start in enumerate(starts, start=1):
         val_start = int(val_start)
@@ -210,19 +199,27 @@ def main() -> None:
             "candidates": {},
         }
         for arch in ARCHITECTURES:
-            metrics = _evaluate_candidate(
+            raw, corrected = _evaluate_candidate(
                 arch, x, y, train_indices, val_start, val_end,
                 recent=args.recent,
                 linear_iterations=args.linear_iterations,
                 mlp_iterations=args.mlp_iterations,
                 seed=args.seed + fold_no,
             )
-            metrics["logloss_improvement_vs_baseline"] = float(baseline["logloss"] - metrics["logloss"])
-            fold["candidates"][arch] = metrics
-            aggregate[arch].append(metrics)
+            raw["logloss_improvement_vs_baseline"] = float(baseline["logloss"] - raw["logloss"])
+            corrected["logloss_improvement_vs_baseline"] = float(baseline["logloss"] - corrected["logloss"])
+            fold["candidates"][arch] = {"raw_balanced": raw, "prior_corrected": corrected}
+            aggregate_raw[arch].append(raw)
+            aggregate_corrected[arch].append(corrected)
         folds.append(fold)
 
-    summary = {arch: _summarize(results) for arch, results in aggregate.items()}
+    summary = {
+        arch: {
+            "raw_balanced": _summarize(aggregate_raw[arch]),
+            "prior_corrected": _summarize(aggregate_corrected[arch]),
+        }
+        for arch in ARCHITECTURES
+    }
 
     latest_train = _eligible_train_indices(rows, intervals, latest_start)
     if len(latest_train) < args.min_train:
@@ -231,31 +228,30 @@ def main() -> None:
     latest_baseline = _baseline(y[latest_selected], y[latest_start:n])
     latest_candidates: dict[str, dict] = {}
     for arch in ARCHITECTURES:
-        metrics = _evaluate_candidate(
+        raw, corrected = _evaluate_candidate(
             arch, x, y, latest_train, latest_start, n,
             recent=args.recent,
             linear_iterations=args.linear_iterations,
             mlp_iterations=args.mlp_iterations,
             seed=args.seed + 1000,
         )
-        metrics["logloss_improvement_vs_baseline"] = float(latest_baseline["logloss"] - metrics["logloss"])
-        latest_candidates[arch] = metrics
+        raw["logloss_improvement_vs_baseline"] = float(latest_baseline["logloss"] - raw["logloss"])
+        corrected["logloss_improvement_vs_baseline"] = float(latest_baseline["logloss"] - corrected["logloss"])
+        latest_candidates[arch] = {"raw_balanced": raw, "prior_corrected": corrected}
 
     gates = {}
     for arch in ARCHITECTURES:
-        passed, reasons = _passes_research_gate(summary[arch], latest_candidates[arch])
-        gates[arch] = {"passed": passed, "reasons": reasons}
+        passed, reasons = _passes_research_gate(summary[arch]["prior_corrected"], latest_candidates[arch]["prior_corrected"])
+        gates[arch] = {"passed": passed, "reasons": reasons, "evaluated_variant": "prior_corrected"}
 
-    # This rank is research-only and cannot authorize trading. It exists solely to make
-    # architecture comparison deterministic for the next engineering step.
     ordered = sorted(
         ARCHITECTURES,
         key=lambda a: (
             not gates[a]["passed"],
-            -summary[a]["positive_logloss_folds"],
-            -summary[a]["mean_logloss_improvement_vs_baseline"],
-            -summary[a]["mean_balanced_accuracy"],
-            latest_candidates[a]["logloss"],
+            -summary[a]["prior_corrected"]["positive_logloss_folds"],
+            -summary[a]["prior_corrected"]["mean_logloss_improvement_vs_baseline"],
+            -summary[a]["prior_corrected"]["mean_balanced_accuracy"],
+            latest_candidates[a]["prior_corrected"]["logloss"],
         ),
     )
 
@@ -264,6 +260,7 @@ def main() -> None:
         "execution_authorized": False,
         "samples": n,
         "label_interval_coverage": coverage,
+        "probability_note": "raw_balanced optimizes class symmetry; prior_corrected restores the causal training-window class prior before probability-sensitive evaluation",
         "settings": {
             "folds": len(starts),
             "validation": args.validation,
