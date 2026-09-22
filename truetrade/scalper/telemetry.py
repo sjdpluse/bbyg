@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import math
 
 from .types import Side
@@ -17,7 +17,9 @@ class ExecutionObservation:
     def __post_init__(self) -> None:
         if self.latency_ms < 0 or self.size <= 0:
             raise ValueError("invalid execution observation")
-        if not all(math.isfinite(v) for v in (self.latency_ms, self.slippage_price, self.slippage_spreads, self.size)):
+        if not all(math.isfinite(v) for v in (
+            self.latency_ms, self.slippage_price, self.slippage_spreads, self.size
+        )):
             raise ValueError("execution telemetry must be finite")
 
 
@@ -28,15 +30,18 @@ class ExecutionTelemetry:
         self.max_samples = max_samples
         self.samples: list[ExecutionObservation] = []
 
+    def observe(self, observation: ExecutionObservation) -> None:
+        self.samples.append(observation)
+        if len(self.samples) > self.max_samples:
+            del self.samples[:len(self.samples) - self.max_samples]
+
     def record(self, *, start_ns: int, end_ns: int, expected_price: float, fill_price: float,
                spread: float, side: Side, size: float, success: bool = True) -> ExecutionObservation:
         if end_ns < start_ns or expected_price <= 0 or fill_price <= 0 or spread <= 0:
             raise ValueError("invalid execution measurement")
         slip = (fill_price - expected_price) * side.sign
         obs = ExecutionObservation((end_ns - start_ns) / 1e6, slip, slip / spread, size, success)
-        self.samples.append(obs)
-        if len(self.samples) > self.max_samples:
-            del self.samples[: len(self.samples) - self.max_samples]
+        self.observe(obs)
         return obs
 
     @staticmethod
@@ -65,3 +70,15 @@ class ExecutionTelemetry:
             "slippage_p50_spreads": self._percentile(slip, 0.50),
             "slippage_p95_spreads": self._percentile(slip, 0.95),
         }
+
+    @staticmethod
+    def serialize(observation: ExecutionObservation) -> dict:
+        return asdict(observation)
+
+    @staticmethod
+    def deserialize(document: dict) -> ExecutionObservation:
+        return ExecutionObservation(
+            float(document["latency_ms"]), float(document["slippage_price"]),
+            float(document["slippage_spreads"]), float(document["size"]),
+            bool(document["success"]),
+        )
