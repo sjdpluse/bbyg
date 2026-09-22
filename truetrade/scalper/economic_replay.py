@@ -17,6 +17,7 @@ class EconomicPolicy:
     cooldown_ms: int = 250
     max_entry_delay_seconds: float = 5.0
     max_gap_seconds: float = 300.0
+    max_holding_ticks: int = 600
 
     def __post_init__(self) -> None:
         if self.max_positions < 1 or self.max_same_side_positions < 1:
@@ -27,6 +28,8 @@ class EconomicPolicy:
             raise ValueError("max_entries_per_second must be positive")
         if self.cooldown_ms < 0 or self.max_entry_delay_seconds <= 0 or self.max_gap_seconds <= 0:
             raise ValueError("invalid timing limits")
+        if self.max_holding_ticks < 1:
+            raise ValueError("max_holding_ticks must be positive")
 
 
 @dataclass(frozen=True)
@@ -109,10 +112,10 @@ def simulate_selective_trades(
 ) -> tuple[list[ClosedTrade], dict[str, int | float]]:
     """Replay selective signals against executable bid/ask ticks.
 
-    A signal observed at a sample timestamp can enter only on the next tick. Targets and
-    stops use the exact same LabelSettings geometry as the historical label builder.
-    Favorable target overshoot is not credited; adverse stop gaps are preserved. Positions
-    are flattened before a >max_gap market gap and at the end of the supplied slice.
+    A decision at a feature timestamp enters only on the first strictly later tick. Target
+    and stop barriers are built from that executable quote. Target overshoot is not credited;
+    adverse stop gaps are preserved. Positions are also closed at ``max_holding_ticks`` so
+    economic replay cannot use more future evidence than the label contract.
     """
     ts = np.asarray(tick_ts, dtype=np.int64)
     bid = np.asarray(bid, dtype=float)
@@ -141,7 +144,8 @@ def simulate_selective_trades(
     valid = entry_indices < len(ts)
     delay_ns = np.zeros(len(entry_indices), dtype=np.int64)
     delay_ns[valid] = ts[entry_indices[valid]] - selected_ts[valid]
-    valid &= delay_ns <= int(policy.max_entry_delay_seconds * 1_000_000_000)
+    max_delay_seconds = min(policy.max_entry_delay_seconds, settings.max_entry_delay_seconds)
+    valid &= delay_ns <= int(max_delay_seconds * 1_000_000_000)
 
     schedule: dict[int, list[tuple[int, float, float, int]]] = {}
     for seq, (ok, idx, p, conf, sig_ts) in enumerate(
@@ -161,6 +165,7 @@ def simulate_selective_trades(
         "entries_blocked_rate_limit": 0,
         "entries_blocked_cooldown": 0,
         "market_gap_flattened": 0,
+        "horizon_flattened": 0,
         "day_end_flattened": 0,
     }
 
@@ -170,6 +175,7 @@ def simulate_selective_trades(
     last_entry_ts: int | None = None
     gap_ns = int(policy.max_gap_seconds * 1_000_000_000)
     cooldown_ns = int(policy.cooldown_ms * 1_000_000)
+    max_holding_ticks = min(policy.max_holding_ticks, settings.max_lookahead_ticks)
 
     for i in range(len(ts)):
         now = int(ts[i])
@@ -193,6 +199,13 @@ def simulate_selective_trades(
                     closed.append(_close_trade(position, exit_price=position.target, exit_index=i,
                                                exit_ts_ns=now, reason="target"))
                     continue
+
+            if i - position.entry_index >= max_holding_ticks:
+                exit_price = float(bid[i] if position.side > 0 else ask[i])
+                closed.append(_close_trade(position, exit_price=exit_price, exit_index=i,
+                                           exit_ts_ns=now, reason="horizon"))
+                stats["horizon_flattened"] = int(stats["horizon_flattened"]) + 1
+                continue
             survivors.append(position)
         open_positions = survivors
 
@@ -304,6 +317,7 @@ def economic_metrics(trades: list[ClosedTrade], scenario: CostScenario) -> dict[
         "median_hold_ms": float(np.median(holds)),
         "target_exits": int(reasons.get("target", 0)),
         "stop_exits": int(reasons.get("stop", 0)),
+        "horizon_exits": int(reasons.get("horizon", 0)),
         "market_gap_exits": int(reasons.get("market_gap", 0)),
         "day_end_exits": int(reasons.get("day_end", 0)),
         "cost_per_trade_spreads": float(scenario.total_extra_cost_spreads),
