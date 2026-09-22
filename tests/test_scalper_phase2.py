@@ -62,6 +62,45 @@ class ScalperPhase2Tests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_one_sided_validation_cannot_promote(self):
+        learner = ChampionChallenger(8)
+        train = []
+        for i in range(600):
+            y = i % 2
+            x = (0.0, 1.0 if y else -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            train.append(Sample(x, y))
+        validation = [Sample((0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 1) for _ in range(120)]
+        report = learner.fit_and_maybe_promote(
+            train, validation, min_train=400, min_validation=120,
+            min_validation_class_count=20,
+        )
+        self.assertFalse(report.promoted)
+        self.assertEqual(report.reason, "validation_class_imbalance")
+        self.assertEqual(report.validation_minority_count, 0)
+        self.assertEqual(learner.generation, 0)
+
+    def test_recent_regime_candidate_can_be_selected(self):
+        learner = ChampionChallenger(8)
+        old = [Sample((0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 0) for _ in range(400)]
+        recent = []
+        validation = []
+        for i in range(400):
+            y = i % 2
+            x = (0.0, 1.0 if y else -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            recent.append(Sample(x, y))
+        for i in range(120):
+            y = i % 2
+            x = (0.0, 1.0 if y else -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            validation.append(Sample(x, y))
+        report = learner.fit_and_maybe_promote(
+            old + recent, validation, recent_train=recent,
+            min_train=400, min_validation=120,
+            min_logloss_improvement=0.001,
+            min_validation_class_count=20,
+        )
+        self.assertIn(report.selected_candidate, {"global", "recent"})
+        self.assertGreaterEqual(report.challenger_balanced_accuracy, 0.5)
+
     def test_telemetry_measures_adverse_slippage(self):
         telemetry = ExecutionTelemetry()
         telemetry.record(start_ns=0, end_ns=2_000_000, expected_price=100.0,
