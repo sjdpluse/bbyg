@@ -54,12 +54,10 @@ class DemoMT5Settings:
     @classmethod
     def from_env(cls) -> "DemoMT5Settings":
         if os.getenv("MT5_MODE", "demo").lower() != "demo":
-            raise ValueError("BBYG Phase 2 execution is DEMO-only")
+            raise ValueError("BBYG execution is DEMO-only")
         return cls(
-            login=int(os.environ["MT5_LOGIN"]),
-            password=os.environ["MT5_PASSWORD"],
-            server=os.environ["MT5_SERVER"],
-            terminal_path=os.environ["MT5_TERMINAL_PATH"],
+            login=int(os.environ["MT5_LOGIN"]), password=os.environ["MT5_PASSWORD"],
+            server=os.environ["MT5_SERVER"], terminal_path=os.environ["MT5_TERMINAL_PATH"],
             symbol=os.getenv("BBYG_MT5_SYMBOL", "XAUUSD"),
             magic=int(os.getenv("BBYG_MT5_MAGIC", "731022")),
             deviation_points=int(os.getenv("BBYG_DEVIATION_POINTS", "20")),
@@ -82,10 +80,12 @@ class ExecutionResult:
     deal_id: int
     start_ns: int
     end_ns: int
+    position_identifier: int | None = None
+    risk_amount: float | None = None
 
 
 class DemoMT5Execution:
-    """Local, DEMO-only MT5 adapter with exactly-one write attempts and verification."""
+    """Local DEMO-only MT5 adapter. Every market write is attempted at most once."""
 
     def __init__(self, settings: DemoMT5Settings, api=None):
         self.settings = settings
@@ -136,13 +136,19 @@ class DemoMT5Execution:
         if account.login != self.settings.login or account.server != self.settings.server:
             raise ExecutionRejected("terminal account identity changed")
         if account.trade_mode != self.api.ACCOUNT_TRADE_MODE_DEMO:
-            raise ExecutionRejected("BBYG Phase 2 refuses non-DEMO accounts")
+            raise ExecutionRejected("BBYG refuses non-DEMO accounts")
         if trading:
             if not account.trade_allowed or not account.trade_expert or not terminal.trade_allowed or terminal.tradeapi_disabled:
                 raise ExecutionRejected("algorithmic trading permission denied")
             if account.margin_mode != self.api.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING:
                 raise ExecutionRejected("hedging demo account required")
         return account
+
+    def account_equity(self) -> float:
+        equity = float(self._account().equity)
+        if equity <= 0 or not math.isfinite(equity):
+            raise DemoExecutionError("invalid demo equity")
+        return equity
 
     def _resolve_symbol(self, requested: str) -> str:
         names = {x.name for x in self.call("symbols_get")}
@@ -188,8 +194,10 @@ class DemoMT5Execution:
             if p.symbol != self.symbol or p.magic != self.settings.magic:
                 continue
             opened_ms = int(getattr(p, "time_msc", 0) or int(getattr(p, "time", time.time())) * 1000)
+            stop = float(getattr(p, "sl", 0.0) or 0.0)
             result.append(PositionState(str(p.ticket), self._side(p.type, self.api), float(p.volume),
-                                        float(p.price_open), opened_ms * 1_000_000))
+                                        float(p.price_open), opened_ms * 1_000_000,
+                                        broker_stop=stop if stop > 0 else None))
         return result
 
     def _raw_position(self, position_id: str):
@@ -202,6 +210,21 @@ class DemoMT5Execution:
         if p.symbol != self.symbol or p.magic != self.settings.magic:
             raise ExecutionRejected("refusing foreign position")
         return p
+
+    def position_ticket_by_identifier(self, identifier: int) -> str | None:
+        matches = [p for p in self.call("positions_get")
+                   if p.symbol == self.symbol and p.magic == self.settings.magic
+                   and int(getattr(p, "identifier", 0)) == int(identifier)]
+        if len(matches) > 1:
+            raise DemoExecutionError("ambiguous position identifier")
+        return None if not matches else str(matches[0].ticket)
+
+    def protection_matches(self, position_id: str, stop: float) -> bool:
+        p = self._raw_position(position_id)
+        if p is None:
+            return False
+        info = self._symbol_info()
+        return abs(float(getattr(p, "sl", 0.0)) - float(stop)) <= float(info.trade_tick_size) / 2
 
     def _clean_for_entry(self) -> None:
         if any(p.symbol == self.symbol and p.magic != self.settings.magic for p in self.call("positions_get")):
@@ -251,12 +274,15 @@ class DemoMT5Execution:
             request["sl"] = float(stop)
         return request
 
-    def _send_once(self, request: dict):
+    def _precheck(self, request: dict) -> None:
         self._account(trading=True)
         check = self.call("order_check", request)
         if type(check.retcode) is not int or check.retcode != 0:
             raise ExecutionRejected("MT5 order_check rejected request")
         self._account(trading=True)
+
+    def _send_once(self, request: dict):
+        self._precheck(request)
         try:
             result = self.api.order_send(request)
         except BaseException as exc:
@@ -274,6 +300,18 @@ class DemoMT5Execution:
             raise ExecutionUncertain(f"uncertain MT5 retcode={retcode}; do not retry")
         return result
 
+    def _send_modify_once(self, request: dict):
+        self._precheck(request)
+        try:
+            result = self.api.order_send(request)
+        except BaseException as exc:
+            raise ExecutionUncertain("MT5 protection update interrupted; do not retry") from exc
+        if result is None or type(getattr(result, "retcode", None)) is not int:
+            raise ExecutionUncertain("MT5 protection update returned malformed result")
+        if result.retcode != self.api.TRADE_RETCODE_DONE:
+            raise ExecutionUncertain("MT5 protection update not conclusively accepted")
+        return result
+
     def _verify_deal(self, result, expected_side: Side):
         if not result.order or not result.deal:
             raise ExecutionUncertain("missing order/deal identifiers")
@@ -287,30 +325,30 @@ class DemoMT5Execution:
             raise ExecutionUncertain("deal history not uniquely verified")
         deal = deals[0]
         expected_type = self.api.DEAL_TYPE_BUY if expected_side is Side.LONG else self.api.DEAL_TYPE_SELL
-        if (deal.order != result.order or deal.position_id != position_identifier or deal.symbol != self.symbol or
-                deal.magic != self.settings.magic or deal.type != expected_type):
+        if (deal.order != result.order or deal.position_id != position_identifier or deal.symbol != self.symbol
+                or deal.magic != self.settings.magic or deal.type != expected_type):
             raise ExecutionUncertain("verified deal ownership mismatch")
         return deal, position_identifier
 
-    def _risk_checked_stop(self, side: Side, volume: float, entry: float, info) -> float:
+    def _risk_checked_stop(self, side: Side, volume: float, entry: float, info) -> tuple[float, float]:
         point = float(info.point)
         distance = max(self.settings.emergency_stop_points, int(info.trade_stops_level) + 1) * point
         stop = round(entry - distance if side is Side.LONG else entry + distance, int(info.digits))
         kind = self.api.ORDER_TYPE_BUY if side is Side.LONG else self.api.ORDER_TYPE_SELL
         pnl = self.call("order_calc_profit", kind, self.symbol, volume, entry, stop)
         risk = max(0.0, -float(pnl)) + volume * self.settings.commission_per_lot
-        equity = float(self._account().equity)
+        equity = self.account_equity()
         if risk <= 0 or risk > equity * self.settings.risk_fraction + 1e-9:
             raise ExecutionRejected("requested size exceeds demo emergency-stop risk budget")
-        return stop
+        return stop, risk
 
     def _fresh_tick_for_write(self) -> Tick:
         tick = self.latest_tick()
         if tick is not None:
             return tick
         raw = self.call("symbol_info_tick", self.symbol)
-        return Tick(max(int(raw.time_msc) * 1_000_000, self._last_tick_ns + 1), float(raw.bid), float(raw.ask),
-                    float(getattr(raw, "last", 0.0) or 0.0),
+        return Tick(max(int(raw.time_msc) * 1_000_000, self._last_tick_ns + 1),
+                    float(raw.bid), float(raw.ask), float(getattr(raw, "last", 0.0) or 0.0),
                     float(getattr(raw, "volume_real", getattr(raw, "volume", 0.0)) or 0.0))
 
     def open(self, side: Side, size: float, decision_id: str) -> ExecutionResult:
@@ -322,7 +360,7 @@ class DemoMT5Execution:
             raise ExecutionRejected("spread limit exceeded")
         volume = self._normalized_volume(size, info)
         expected = tick.ask if side is Side.LONG else tick.bid
-        stop = self._risk_checked_stop(side, volume, expected, info)
+        stop, risk = self._risk_checked_stop(side, volume, expected, info)
         request = self._request(info, side, volume, expected, decision_id=decision_id, stop=stop)
         start = time.perf_counter_ns()
         result = self._send_once(request)
@@ -338,7 +376,8 @@ class DemoMT5Execution:
         if float(getattr(p, "sl", 0.0)) <= 0:
             raise ExecutionUncertain("emergency stop not observable")
         return ExecutionResult(decision_id, "OPEN", str(p.ticket), float(deal.volume), expected,
-                               float(deal.price), int(result.order), int(result.deal), start, end)
+                               float(deal.price), int(result.order), int(result.deal), start, end,
+                               position_identifier=identifier, risk_amount=risk)
 
     def close(self, position_id: str, fraction: float, decision_id: str) -> ExecutionResult:
         self._account(trading=True)
@@ -351,11 +390,12 @@ class DemoMT5Execution:
         closing_side = Side.SHORT if self._side(p.type, self.api) is Side.LONG else Side.LONG
         tick = self._fresh_tick_for_write()
         expected = tick.ask if closing_side is Side.LONG else tick.bid
-        request = self._request(info, closing_side, volume, expected, decision_id=decision_id, position=int(p.ticket))
+        request = self._request(info, closing_side, volume, expected,
+                                decision_id=decision_id, position=int(p.ticket))
         start = time.perf_counter_ns()
         result = self._send_once(request)
         end = time.perf_counter_ns()
-        deal, _identifier = self._verify_deal(result, closing_side)
+        deal, identifier = self._verify_deal(result, closing_side)
         if int(deal.position_id) != int(p.identifier):
             raise ExecutionUncertain("exit deal position mismatch")
         after = self._raw_position(position_id)
@@ -370,7 +410,48 @@ class DemoMT5Execution:
             remaining_id = position_id
         action = "CLOSE" if fraction >= 1.0 - 1e-12 else "REDUCE"
         return ExecutionResult(decision_id, action, remaining_id, float(deal.volume), expected,
-                               float(deal.price), int(result.order), int(result.deal), start, end)
+                               float(deal.price), int(result.order), int(result.deal), start, end,
+                               position_identifier=identifier)
+
+    def tighten_stop(self, position_id: str, stop: float, decision_id: str) -> ExecutionResult:
+        self._account(trading=True)
+        p = self._raw_position(position_id)
+        if p is None:
+            raise ExecutionRejected("position already absent")
+        info = self._symbol_info()
+        tick = self._fresh_tick_for_write()
+        side = self._side(p.type, self.api)
+        current = float(getattr(p, "sl", 0.0) or 0.0)
+        point = float(info.point)
+        distance_points = max(int(info.trade_stops_level), int(info.trade_freeze_level), 1) + 1
+        minimum_distance = distance_points * point
+        if side is Side.LONG:
+            candidate = min(float(stop), tick.bid - minimum_distance)
+            if current > 0 and candidate <= current + float(info.trade_tick_size) / 2:
+                raise ExecutionRejected("stop would not tighten")
+            if candidate <= 0 or candidate >= tick.bid:
+                raise ExecutionRejected("invalid long protective stop")
+        else:
+            candidate = max(float(stop), tick.ask + minimum_distance)
+            if current > 0 and candidate >= current - float(info.trade_tick_size) / 2:
+                raise ExecutionRejected("stop would not tighten")
+            if candidate <= tick.ask:
+                raise ExecutionRejected("invalid short protective stop")
+        candidate = round(candidate, int(info.digits))
+        request = {"action": self.api.TRADE_ACTION_SLTP, "position": int(p.ticket),
+                   "symbol": self.symbol, "sl": candidate,
+                   "tp": float(getattr(p, "tp", 0.0) or 0.0), "magic": self.settings.magic}
+        start = time.perf_counter_ns()
+        result = self._send_modify_once(request)
+        end = time.perf_counter_ns()
+        observed = self._raw_position(position_id)
+        if observed is None:
+            raise ExecutionUncertain("position disappeared during protection update")
+        if abs(float(getattr(observed, "sl", 0.0)) - candidate) > float(info.trade_tick_size) / 2:
+            raise ExecutionUncertain("protection readback mismatch")
+        return ExecutionResult(decision_id, "PROTECT", position_id, 0.0, candidate, candidate,
+                               int(getattr(result, "order", 0) or 0), int(getattr(result, "deal", 0) or 0),
+                               start, end, position_identifier=int(p.identifier))
 
     def execute(self, intent: Intent, decision_id: str) -> ExecutionResult | None:
         if intent.kind is IntentKind.HOLD:
@@ -382,7 +463,13 @@ class DemoMT5Execution:
         if intent.kind in {IntentKind.REDUCE, IntentKind.CLOSE}:
             if intent.position_id is None:
                 raise ExecutionRejected("exit intent missing position id")
-            return self.close(intent.position_id, 1.0 if intent.kind is IntentKind.CLOSE else intent.fraction, decision_id)
+            return self.close(intent.position_id,
+                              1.0 if intent.kind is IntentKind.CLOSE else intent.fraction,
+                              decision_id)
+        if intent.kind is IntentKind.PROTECT:
+            if intent.position_id is None or intent.stop is None:
+                raise ExecutionRejected("protection intent missing position/stop")
+            return self.tighten_stop(intent.position_id, intent.stop, decision_id)
         raise ExecutionRejected("unsupported intent")
 
     def find_decision(self, decision_id: str, *, hours: int = 24):
@@ -393,3 +480,38 @@ class DemoMT5Execution:
         if len(matches) > 1:
             raise DemoExecutionError("ambiguous decision history")
         return None if not matches else matches[0]
+
+    def closed_outcome(self, position_identifier: int) -> dict | None:
+        deals = [d for d in self.call("history_deals_get", position=int(position_identifier))
+                 if d.magic == self.settings.magic and d.symbol == self.symbol]
+        if not deals:
+            return None
+        entry_in = getattr(self.api, "DEAL_ENTRY_IN")
+        entry_out = getattr(self.api, "DEAL_ENTRY_OUT")
+        out_by = getattr(self.api, "DEAL_ENTRY_OUT_BY", None)
+        entries = [d for d in deals if d.entry == entry_in]
+        exits = [d for d in deals if d.entry == entry_out or (out_by is not None and d.entry == out_by)]
+        if not entries or not exits:
+            return None
+        entry_volume = sum(float(d.volume) for d in entries)
+        exit_volume = sum(float(d.volume) for d in exits)
+        if abs(entry_volume - exit_volume) > 1e-8:
+            return None
+        all_deals = sorted(deals, key=lambda d: int(getattr(d, "time_msc", 0)))
+        profit = sum(float(getattr(d, "profit", 0.0) or 0.0) for d in all_deals)
+        commission = sum(float(getattr(d, "commission", 0.0) or 0.0) for d in all_deals)
+        swap = sum(float(getattr(d, "swap", 0.0) or 0.0) for d in all_deals)
+        fee = sum(float(getattr(d, "fee", 0.0) or 0.0) for d in all_deals)
+        values = (profit, commission, swap, fee, entry_volume)
+        if not all(math.isfinite(x) for x in values):
+            raise DemoExecutionError("non-finite closed outcome")
+        opened_ns = int(getattr(entries[0], "time_msc", 0)) * 1_000_000
+        closed_ns = int(getattr(exits[-1], "time_msc", 0)) * 1_000_000
+        if opened_ns <= 0 or closed_ns < opened_ns:
+            raise DemoExecutionError("invalid deal timestamps")
+        return {
+            "broker_identifier": int(position_identifier), "opened_ns": opened_ns,
+            "closed_ns": closed_ns, "net_pnl": profit + commission + swap + fee,
+            "profit": profit, "commission": commission, "swap": swap, "fee": fee,
+            "volume": entry_volume, "deal_ids": [int(d.ticket) for d in all_deals],
+        }
