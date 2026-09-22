@@ -25,6 +25,33 @@ def _eligible_train_indices(rows, intervals, validation_start: int) -> np.ndarra
     return np.asarray(eligible, dtype=int)
 
 
+def _first_feasible_validation_start(
+    rows,
+    intervals,
+    preferred_start: int,
+    latest_possible_start: int,
+    min_train: int,
+) -> int | None:
+    """Find the earliest validation boundary with enough fully resolved labels.
+
+    ``min_train`` is a requirement on leakage-safe *eligible* rows, not merely on the
+    numeric validation index. A few labels immediately before a boundary can still be
+    resolving into the validation period, so starting exactly at ``min_train`` may leave
+    fewer than ``min_train`` usable observations. Advance only as far as necessary.
+    """
+    start = max(int(preferred_start), int(min_train))
+    latest = int(latest_possible_start)
+    while start <= latest:
+        eligible = _eligible_train_indices(rows, intervals, start)
+        if len(eligible) >= min_train:
+            return start
+        # At least one new row becomes part of the historical prefix each step. Jump by
+        # the current deficit to avoid repeatedly scanning almost-identical prefixes;
+        # any still-unresolved labels are checked again at the new boundary.
+        start += max(1, min_train - len(eligible))
+    return None
+
+
 def _evaluate_candidate(
     architecture: str,
     x: np.ndarray,
@@ -147,11 +174,21 @@ def main() -> None:
 
     # The walk-forward folds end before the final independent latest block so that the
     # same newest evidence is not used for architecture selection and final confirmation.
-    latest_fold_end = latest_start - args.validation
-    earliest_fold_start = args.min_train
-    if latest_fold_end <= earliest_fold_start:
+    latest_fold_start = latest_start - args.validation
+    if latest_fold_start <= args.min_train:
         raise SystemExit("not enough samples for requested folds and final holdout")
-    starts = np.unique(np.linspace(earliest_fold_start, latest_fold_end, args.folds, dtype=int))
+    earliest_fold_start = _first_feasible_validation_start(
+        rows,
+        intervals,
+        args.min_train,
+        latest_fold_start,
+        args.min_train,
+    )
+    if earliest_fold_start is None:
+        raise SystemExit("no leakage-safe fold has enough training samples")
+    starts = np.unique(np.linspace(earliest_fold_start, latest_fold_start, args.folds, dtype=int))
+    if len(starts) < args.folds:
+        raise SystemExit("not enough distinct chronological folds")
 
     aggregate: dict[str, list[dict]] = {a: [] for a in ARCHITECTURES}
     folds: list[dict] = []
@@ -236,6 +273,8 @@ def main() -> None:
             "linear_iterations": args.linear_iterations,
             "mlp_iterations": args.mlp_iterations,
             "seed": args.seed,
+            "requested_first_fold_start": args.min_train,
+            "actual_first_fold_start": int(earliest_fold_start),
         },
         "summary": summary,
         "latest_holdout": {
