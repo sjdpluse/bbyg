@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 import numpy as np
 
@@ -145,6 +144,14 @@ class FastGapAwareReplayBuilder:
             raise ValueError("non-finite vectorized feature")
         return matrix
 
+    @staticmethod
+    def _first_true(mask: np.ndarray, valid: np.ndarray) -> np.ndarray:
+        event = mask & valid
+        has = np.any(event, axis=1)
+        first = np.argmax(event, axis=1).astype(np.int64)
+        first[~has] = np.iinfo(np.int64).max
+        return first
+
     def _label_batch(
         self,
         anchors: np.ndarray,
@@ -187,37 +194,37 @@ class FastGapAwareReplayBuilder:
 
         spread = np.maximum(ask[a] - bid[a], 1e-12)
         long_profit = ask[a] + (s.profit_spreads + s.extra_cost_spreads) * spread
-        long_loss = bid[a] - s.loss_spreads * spread
+        long_stop = bid[a] - s.loss_spreads * spread
         short_profit = bid[a] - (s.profit_spreads + s.extra_cost_spreads) * spread
-        short_loss = ask[a] + s.loss_spreads * spread
+        short_stop = ask[a] + s.loss_spreads * spread
 
-        long_win = (fb >= long_profit[:, None]) & valid
-        short_win = (fa <= short_profit[:, None]) & valid
-        adverse = (fb <= long_loss[:, None]) & (fa >= short_loss[:, None]) & valid
-        event = long_win | short_win | adverse
-        has_event = np.any(event, axis=1)
-        first = np.argmax(event, axis=1)
-        row_idx = np.arange(len(a))
-        first_long = long_win[row_idx, first] & has_event
-        first_short = short_win[row_idx, first] & has_event
-        ambiguous_profit = first_long & first_short
-        long_label = first_long & ~ambiguous_profit
-        short_label = first_short & ~first_long
-        labeled = long_label | short_label
+        first_long_target = self._first_true(fb >= long_profit[:, None], valid)
+        first_long_stop = self._first_true(fb <= long_stop[:, None], valid)
+        first_short_target = self._first_true(fa <= short_profit[:, None], valid)
+        first_short_stop = self._first_true(fa >= short_stop[:, None], valid)
+
+        long_wins = first_long_target < first_long_stop
+        short_wins = first_short_target < first_short_stop
+        both_win = long_wins & short_wins
+        long_first = long_wins & (~short_wins | (first_long_target < first_short_target))
+        short_first = short_wins & (~long_wins | (first_short_target < first_long_target))
+        ambiguous = both_win & (first_long_target == first_short_target)
+        labeled = (long_first | short_first) & ~ambiguous
         skipped += int((~labeled).sum())
 
-        observed = first + 1
+        winning_index = np.where(long_first, first_long_target, first_short_target)
         sample_rows: list[tuple[int, Sample]] = []
         interval_rows: list[SampleLabelInterval] = []
         for j in np.flatnonzero(labeled):
-            label = 1 if bool(long_label[j]) else 0
+            label = 1 if bool(long_first[j]) else 0
             anchor_index = int(a[j])
-            ticks_observed = int(observed[j])
+            event_zero_based = int(winning_index[j])
+            ticks_observed = event_zero_based + 1
             feature_ts = int(ts[anchor_index])
             end_ts = int(ts[anchor_index + ticks_observed])
             sample_rows.append((feature_ts, Sample(tuple(float(x) for x in v[j]), label)))
             interval_rows.append(SampleLabelInterval(feature_ts, end_ts, ticks_observed))
-        return sample_rows, interval_rows, skipped, int(long_label.sum()), int(short_label.sum())
+        return sample_rows, interval_rows, skipped, int((long_first & ~ambiguous).sum()), int((short_first & ~ambiguous).sum())
 
     def build(self, store: ScalperStore, *, reset_learning: bool = True, progress=None) -> FastReplayReport:
         if reset_learning:
@@ -251,8 +258,6 @@ class FastGapAwareReplayBuilder:
                 long_labels += sub_long
                 short_labels += sub_short
 
-            # Existing helpers already commit in bounded batches. Keeping sample and interval
-            # writes separate is safe because this is an offline research rebuild with execution off.
             for write_start in range(0, len(batch_samples), self.write_batch):
                 write_end = write_start + self.write_batch
                 labeled += store.add_samples(batch_samples[write_start:write_end])
@@ -269,8 +274,6 @@ class FastGapAwareReplayBuilder:
                 )
 
         if labeled != store.sample_count():
-            # The fast builder starts from a learning reset by default. A mismatch would mean
-            # callers deliberately disabled reset or the database contained colliding sample keys.
             labeled = store.sample_count()
         return FastReplayReport(
             ticks=n,
