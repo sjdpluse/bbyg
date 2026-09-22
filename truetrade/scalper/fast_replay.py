@@ -23,6 +23,7 @@ class FastReplayReport:
     stride: int
     extra_cost_spreads: float
     stop_reference: str
+    max_entry_delay_seconds: float
     nominal_target_from_entry_spreads: float
     nominal_stop_from_entry_spreads: float
 
@@ -30,9 +31,10 @@ class FastReplayReport:
 class FastGapAwareReplayBuilder:
     """Vectorized replay for multi-million-tick research datasets.
 
-    It keeps the live feature definitions but requires a full 96-tick feature warmup after
-    startup or a market gap. Label evidence is capped at the first market gap, so a Friday
-    close can never use Sunday/Monday quotes to resolve a seconds-scalping label.
+    Features are observed at a causal decision tick. A hypothetical order may enter only
+    on the first strictly later tick, matching economic/demo execution. Target/stop paths
+    are then evaluated from that executable entry quote. A full 96-tick feature warmup is
+    required after startup or a market gap, and label evidence never crosses a market gap.
     """
 
     FEATURE_WINDOW = 96
@@ -169,37 +171,53 @@ class FastGapAwareReplayBuilder:
         s = self.labeler.settings
         n = len(ts)
         max_future = int(s.max_lookahead_ticks)
-        offsets = np.arange(1, max_future + 1, dtype=np.int64)
+        future_offsets = np.arange(1, max_future + 1, dtype=np.int64)
 
+        # Decision at anchor -> first strictly later tick is the executable entry.
+        entry = anchors + 1
+        entry_exists = entry < n
+        entry_delay_ok = np.zeros(len(anchors), dtype=bool)
+        if np.any(entry_exists):
+            delay_ns = ts[entry[entry_exists]] - ts[anchors[entry_exists]]
+            entry_delay_ok[entry_exists] = delay_ns <= int(s.max_entry_delay_seconds * 1_000_000_000)
+
+        # An entry may not jump across a market closure/gap.
         next_gap_pos = np.searchsorted(gap_starts, anchors, side="right")
         next_gap = np.full(len(anchors), n, dtype=np.int64)
         has_gap = next_gap_pos < len(gap_starts)
         if np.any(has_gap):
             next_gap[has_gap] = gap_starts[next_gap_pos[has_gap]]
-        future_count = np.minimum.reduce((
-            np.full(len(anchors), max_future, dtype=np.int64),
-            next_gap - anchors - 1,
-            np.full(len(anchors), n, dtype=np.int64) - anchors - 1,
-        ))
-        enough = future_count >= 10
+        entry_before_gap = entry < next_gap
+        executable = entry_exists & entry_delay_ok & entry_before_gap
+
+        # Label evidence starts after entry and is capped at the next market gap.
+        future_count = np.zeros(len(anchors), dtype=np.int64)
+        if np.any(executable):
+            future_count[executable] = np.minimum.reduce((
+                np.full(int(executable.sum()), max_future, dtype=np.int64),
+                next_gap[executable] - entry[executable] - 1,
+                np.full(int(executable.sum()), n, dtype=np.int64) - entry[executable] - 1,
+            ))
+        enough = executable & (future_count >= 10)
         skipped = int((~enough).sum())
         if not np.any(enough):
             return [], [], skipped, 0, 0
 
-        a = anchors[enough]
+        decision = anchors[enough]
+        e = entry[enough]
         v = vectors[enough]
         counts = future_count[enough]
-        idx = a[:, None] + offsets[None, :]
+        idx = e[:, None] + future_offsets[None, :]
         safe_idx = np.minimum(idx, n - 1)
-        valid = offsets[None, :] <= counts[:, None]
+        valid = future_offsets[None, :] <= counts[:, None]
         fb = bid[safe_idx]
         fa = ask[safe_idx]
 
-        spread = np.maximum(ask[a] - bid[a], 1e-12)
-        long_profit = ask[a] + (s.profit_spreads + s.extra_cost_spreads) * spread
-        long_stop = s.long_stop_price(bid[a], ask[a], spread)
-        short_profit = bid[a] - (s.profit_spreads + s.extra_cost_spreads) * spread
-        short_stop = s.short_stop_price(bid[a], ask[a], spread)
+        spread = np.maximum(ask[e] - bid[e], 1e-12)
+        long_profit = ask[e] + (s.profit_spreads + s.extra_cost_spreads) * spread
+        long_stop = s.long_stop_price(bid[e], ask[e], spread)
+        short_profit = bid[e] - (s.profit_spreads + s.extra_cost_spreads) * spread
+        short_stop = s.short_stop_price(bid[e], ask[e], spread)
 
         first_long_target = self._first_true(fb >= long_profit[:, None], valid)
         first_long_stop = self._first_true(fb <= long_stop[:, None], valid)
@@ -220,11 +238,13 @@ class FastGapAwareReplayBuilder:
         interval_rows: list[SampleLabelInterval] = []
         for j in np.flatnonzero(labeled):
             label = 1 if bool(long_first[j]) else 0
-            anchor_index = int(a[j])
+            decision_index = int(decision[j])
+            entry_index = int(e[j])
             event_zero_based = int(winning_index[j])
-            ticks_observed = event_zero_based + 1
-            feature_ts = int(ts[anchor_index])
-            end_ts = int(ts[anchor_index + ticks_observed])
+            end_index = entry_index + event_zero_based + 1
+            ticks_observed = end_index - decision_index
+            feature_ts = int(ts[decision_index])
+            end_ts = int(ts[end_index])
             sample_rows.append((feature_ts, Sample(tuple(float(x) for x in v[j]), label)))
             interval_rows.append(SampleLabelInterval(feature_ts, end_ts, ticks_observed))
         return sample_rows, interval_rows, skipped, int((long_first & ~ambiguous).sum()), int((short_first & ~ambiguous).sum())
@@ -234,7 +254,7 @@ class FastGapAwareReplayBuilder:
             store.reset_learning_state()
         ts, bid, ask = self._load_arrays(store)
         n = len(ts)
-        if n < self.FEATURE_WINDOW + 10:
+        if n < self.FEATURE_WINDOW + 11:
             raise ValueError("not enough ticks for replay")
         anchors, gap_starts = self._anchors(ts)
         if progress is not None:
@@ -290,6 +310,7 @@ class FastGapAwareReplayBuilder:
             stride=self.stride,
             extra_cost_spreads=self.labeler.settings.extra_cost_spreads,
             stop_reference=self.labeler.settings.stop_reference,
+            max_entry_delay_seconds=self.labeler.settings.max_entry_delay_seconds,
             nominal_target_from_entry_spreads=self.labeler.settings.nominal_target_from_entry_spreads,
             nominal_stop_from_entry_spreads=self.labeler.settings.nominal_stop_from_entry_spreads,
         )
