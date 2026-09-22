@@ -47,8 +47,11 @@ class StopAwareLabelTests(unittest.TestCase):
         labeler = CostAwareLabeler(settings)
         builder = FastGapAwareReplayBuilder(labeler=labeler, stride=1)
 
-        # Include 96 warm-up ticks, then three anchor trajectories.  We call the
+        # Include 96 warm-up ticks, then three anchor trajectories. We call the
         # vectorized label helper directly so this test is about label semantics only.
+        # The replay contract requires at least 10 future ticks at an anchor, so add a
+        # flat tail after the three trajectories rather than testing an end-of-stream
+        # insufficiency at the same time.
         bid = [99.9] * 96
         ask = [100.1] * 96
         ts = list(range(1, 97))
@@ -65,6 +68,10 @@ class StopAwareLabelTests(unittest.TestCase):
         bid += [100.0, 99.7, 100.5, 100.5]
         ask += [100.2, 99.9, 100.7, 100.7]
         ts += list(range(105, 109))
+        # Sufficient trailing evidence for all three anchors.
+        bid += [100.0] * 10
+        ask += [100.2] * 10
+        ts += list(range(109, 119))
 
         ts_arr = np.asarray(ts, dtype=np.int64)
         bid_arr = np.asarray(bid, dtype=float)
