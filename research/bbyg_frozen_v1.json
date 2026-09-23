@@ -1,0 +1,53 @@
+{
+  "protocol": "bbyg_forward_confirmation_v1",
+  "frozen_after_utc_date": "2026-09-22",
+  "execution_authorized": false,
+  "commission_verified": false,
+  "model": {
+    "architecture": "linear",
+    "probability_variant": "raw_balanced",
+    "recent_train_samples": 20000,
+    "minimum_train_samples": 10000,
+    "iterations": 140,
+    "seed": 731022
+  },
+  "calibration": {
+    "samples": 5000,
+    "thresholds": [0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58, 0.59, 0.60],
+    "minimum_trades": 100,
+    "minimum_profit_factor": 1.05
+  },
+  "trade_geometry": {
+    "profit_spreads": 1.6,
+    "loss_spreads": 1.4,
+    "label_extra_cost_spreads": 0.2,
+    "stop_reference": "entry",
+    "max_lookahead_ticks": 600,
+    "max_entry_delay_seconds": 5.0
+  },
+  "portfolio_policy": {
+    "max_positions": 6,
+    "max_same_side_positions": 4,
+    "max_entries_per_second": 4,
+    "cooldown_ms": 0,
+    "max_entry_delay_seconds": 5.0,
+    "max_gap_seconds": 300.0
+  },
+  "economic_cost": {
+    "name": "base_0p20",
+    "slippage_per_side_spreads": 0.05,
+    "commission_roundturn_spreads": 0.10,
+    "total_extra_cost_spreads": 0.20
+  },
+  "validation": {
+    "minimum_day_samples": 3000,
+    "exclude_latest_stored_utc_date_by_default": true
+  },
+  "notes": [
+    "Dates on or before 2026-09-22 were inspected during methodology development and are not final confirmation data.",
+    "Only UTC dates strictly after the freeze date count as forward confirmation.",
+    "The latest stored UTC date is excluded by default to avoid scoring a partial trading day.",
+    "A day with no calibration threshold passing the economic gate is an abstention, not a failed trade day.",
+    "This research protocol never authorizes demo or live execution."
+  ]
+}
