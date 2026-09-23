@@ -13,8 +13,22 @@ from truetrade.scalper.store import ScalperStore
 from truetrade.scalper.timebase import BrokerTimebase, TimeNormalizedDemoMT5Execution
 
 
+REQUIRED_MT5_ENV = ("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_TERMINAL_PATH")
+
+
 def _print(stage: str, **fields) -> None:
     print(json.dumps({"stage": stage, **fields}, sort_keys=True), flush=True)
+
+
+def _require_mt5_env() -> None:
+    missing = [name for name in REQUIRED_MT5_ENV if not os.getenv(name)]
+    if missing:
+        raise SystemExit(
+            "missing MT5 environment variables: " + ", ".join(missing)
+            + ". Configure the DEMO MT5 session in this PowerShell window and retry."
+        )
+    if os.getenv("MT5_MODE", "demo").lower() != "demo":
+        raise SystemExit("MT5_MODE must be 'demo'; BBYG history collection is DEMO-only")
 
 
 def main() -> None:
@@ -30,6 +44,7 @@ def main() -> None:
     if not 100_000 <= args.max_total_ticks <= 10_000_000:
         raise SystemExit("--max-total-ticks must be between 100,000 and 10,000,000")
 
+    _require_mt5_env()
     state_dir = Path(os.getenv("BBYG_STATE_DIR", "data/bbyg-multiday"))
     state_dir.mkdir(parents=True, exist_ok=True)
     store = ScalperStore(state_dir / "scalper.sqlite")
@@ -101,9 +116,6 @@ def main() -> None:
             if total_inserted >= args.max_total_ticks:
                 raise SystemExit(f"hard tick cap reached at {total_inserted}; increase --max-total-ticks deliberately")
 
-            # copy_ticks_range is inclusive at broker boundaries. Reusing the exact
-            # boundary avoids any 1ms hole; INSERT OR IGNORE makes the repeated boundary
-            # deterministic and harmless.
             cursor = end
 
         first_iso = None
