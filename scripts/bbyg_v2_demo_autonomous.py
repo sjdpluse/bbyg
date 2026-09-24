@@ -20,8 +20,6 @@ from truetrade.scalper.types import Side, Tick
 
 FEATURE_WINDOW = 96
 STRIDE = 4
-TARGET_SPREADS = 1.8
-INITIAL_STOP_SPREADS = 1.4
 MAX_HOLD_TICKS = 600
 MAX_GAP_NS = 300_000_000_000
 MAX_ENTRY_DELAY_NS = 5_000_000_000
@@ -33,6 +31,8 @@ class PendingEntry:
     signal_ts_ns: int
     probability_long: float
     confidence: float
+    signal_no: int
+    copy_no: int
 
 
 @dataclass
@@ -42,13 +42,14 @@ class ActiveTrade:
     side: Side
     entry: float
     entry_spread: float
-    target: float
-    stop: float
     entry_tick_no: int
     opened_ns: int
-    protected_stop: float | None = None
-    protection_stage: int = 0
+    emergency_risk_usd: float
+    signal_no: int
+    copy_no: int
     peak_favorable_spreads: float = 0.0
+    algo_floor_spreads: float | None = None
+    protection_stage: str = "none"
 
 
 def emit(stage: str, **fields) -> None:
@@ -89,7 +90,7 @@ def wait_closed_outcome(broker: TimeNormalizedDemoMT5Execution, identifier: int)
 
 def close_trade(broker: TimeNormalizedDemoMT5Execution, trade: ActiveTrade,
                 tick: Tick, reason: str) -> float:
-    """Close one managed trade while tolerating a broker-SL race without blind retries."""
+    """Algorithmic market close with broker-side race reconciliation and no blind retries."""
     fill_price = None
     try:
         result = broker.close(trade.ticket, 1.0, decision_id("close", tick.ts_ns, trade.side))
@@ -111,7 +112,10 @@ def close_trade(broker: TimeNormalizedDemoMT5Execution, trade: ActiveTrade,
             ticket=trade.ticket,
             fill_price=None,
             net_pnl_usd=pnl,
-            outcome=outcome,
+            peak_favorable_spreads=trade.peak_favorable_spreads,
+            algo_floor_spreads=trade.algo_floor_spreads,
+            signal_no=trade.signal_no,
+            copy_no=trade.copy_no,
         )
         return pnl
 
@@ -126,6 +130,10 @@ def close_trade(broker: TimeNormalizedDemoMT5Execution, trade: ActiveTrade,
         ticket=trade.ticket,
         fill_price=fill_price,
         net_pnl_usd=pnl,
+        peak_favorable_spreads=trade.peak_favorable_spreads,
+        algo_floor_spreads=trade.algo_floor_spreads,
+        signal_no=trade.signal_no,
+        copy_no=trade.copy_no,
     )
     return pnl
 
@@ -136,8 +144,11 @@ def favorable_spreads(trade: ActiveTrade, tick: Tick) -> float:
     return (trade.entry - tick.ask) / max(trade.entry_spread, 1e-12)
 
 
-def maybe_tighten_profit_stop(
-    broker: TimeNormalizedDemoMT5Execution,
+def directional_probability(side: Side, p_long: float) -> float:
+    return p_long if side is Side.LONG else 1.0 - p_long
+
+
+def update_algorithmic_protection(
     trade: ActiveTrade,
     tick: Tick,
     *,
@@ -146,113 +157,65 @@ def maybe_tighten_profit_stop(
     profit_lock_spreads: float,
     trailing_trigger: float,
     trailing_distance_spreads: float,
-    protection_step_spreads: float,
 ) -> None:
-    """Move broker SL only in the profitable direction: break-even -> lock -> trail."""
+    """Software-only profit protection. It does not modify the broker SL."""
     fav = favorable_spreads(trade, tick)
     trade.peak_favorable_spreads = max(trade.peak_favorable_spreads, fav)
-    desired = None
-    desired_stage = trade.protection_stage
-    stage_name = None
+    peak = trade.peak_favorable_spreads
 
-    if fav >= break_even_trigger and trade.protection_stage < 1:
-        desired = trade.entry
-        desired_stage = 1
-        stage_name = "break_even"
+    floor = trade.algo_floor_spreads
+    stage = trade.protection_stage
 
-    if fav >= profit_lock_trigger:
-        locked = (trade.entry + profit_lock_spreads * trade.entry_spread
-                  if trade.side is Side.LONG
-                  else trade.entry - profit_lock_spreads * trade.entry_spread)
-        if desired is None or (trade.side is Side.LONG and locked > desired) or (
-            trade.side is Side.SHORT and locked < desired
-        ):
-            desired = locked
-            desired_stage = max(desired_stage, 2)
-            stage_name = "profit_lock"
+    if peak >= break_even_trigger:
+        floor = max(0.0, floor if floor is not None else 0.0)
+        stage = "break_even"
+    if peak >= profit_lock_trigger:
+        floor = max(profit_lock_spreads, floor if floor is not None else profit_lock_spreads)
+        stage = "profit_lock"
+    if peak >= trailing_trigger:
+        trailing_floor = peak - trailing_distance_spreads
+        floor = max(trailing_floor, floor if floor is not None else trailing_floor)
+        stage = "trailing"
 
-    if fav >= trailing_trigger:
-        trailing = (tick.bid - trailing_distance_spreads * trade.entry_spread
-                    if trade.side is Side.LONG
-                    else tick.ask + trailing_distance_spreads * trade.entry_spread)
-        if desired is None or (trade.side is Side.LONG and trailing > desired) or (
-            trade.side is Side.SHORT and trailing < desired
-        ):
-            desired = trailing
-            desired_stage = 3
-            stage_name = "trailing"
-
-    if desired is None:
-        return
-
-    current = trade.protected_stop
-    min_improvement = protection_step_spreads * trade.entry_spread
-    if current is not None:
-        if trade.side is Side.LONG and desired <= current + min_improvement:
-            return
-        if trade.side is Side.SHORT and desired >= current - min_improvement:
-            return
-
-    try:
-        result = broker.tighten_stop(
-            trade.ticket,
-            float(desired),
-            decision_id("protect", tick.ts_ns, trade.side),
-        )
-    except ExecutionRejected as exc:
-        # A temporary freeze/min-distance rejection is non-fatal because the existing
-        # emergency SL stays on the broker. If the position vanished, reconciliation
-        # on the next tick will collect its closed outcome.
+    if floor != trade.algo_floor_spreads or stage != trade.protection_stage:
+        trade.algo_floor_spreads = floor
+        trade.protection_stage = stage
         emit(
-            "protection_rejected",
+            "algo_protection_updated",
             ticket=trade.ticket,
             side=trade.side.value,
-            protection=stage_name,
-            favorable_spreads=fav,
-            error=str(exc),
+            protection=stage,
+            peak_favorable_spreads=peak,
+            algo_floor_spreads=floor,
+            signal_no=trade.signal_no,
+            copy_no=trade.copy_no,
         )
-        return
-
-    actual_stop = float(result.fill_price)
-    trade.protected_stop = actual_stop
-    trade.protection_stage = desired_stage
-    if trade.side is Side.LONG:
-        trade.stop = max(trade.stop, actual_stop)
-    else:
-        trade.stop = min(trade.stop, actual_stop)
-    emit(
-        "protection_tightened",
-        ticket=trade.ticket,
-        side=trade.side.value,
-        protection=stage_name,
-        favorable_spreads=fav,
-        peak_favorable_spreads=trade.peak_favorable_spreads,
-        new_stop=actual_stop,
-        entry=trade.entry,
-    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="EXPERIMENTAL multi-position BBYG v2 MT5 DEMO runner. Never permits a live account."
+        description="EXPERIMENTAL multi-position BBYG v2 MT5 DEMO runner with algorithmic exits."
     )
     parser.add_argument("--hours", type=float, default=2.0)
-    parser.add_argument("--threshold", type=float, default=0.55)
+    parser.add_argument("--threshold", type=float, default=0.52)
+    parser.add_argument("--exit-reversal-threshold", type=float, default=0.55)
+    parser.add_argument("--edge-fade-threshold", type=float, default=0.52)
+    parser.add_argument("--edge-fade-min-profit-spreads", type=float, default=0.35)
     parser.add_argument("--size", type=float, default=0.01)
-    parser.add_argument("--max-trades", type=int, default=300)
+    parser.add_argument("--entries-per-signal", type=int, default=4)
+    parser.add_argument("--max-trades", type=int, default=500)
     parser.add_argument("--max-open-positions", type=int, default=30)
-    parser.add_argument("--max-same-side", type=int, default=24)
-    parser.add_argument("--max-entries-per-second", type=int, default=4)
-    parser.add_argument("--max-session-loss-usd", type=float, default=20.0)
-    parser.add_argument("--max-aggregate-emergency-risk-usd", type=float, default=15.0)
-    parser.add_argument("--break-even-trigger-spreads", type=float, default=0.80)
-    parser.add_argument("--profit-lock-trigger-spreads", type=float, default=1.00)
-    parser.add_argument("--profit-lock-spreads", type=float, default=0.25)
-    parser.add_argument("--trailing-trigger-spreads", type=float, default=1.20)
-    parser.add_argument("--trailing-distance-spreads", type=float, default=0.60)
-    parser.add_argument("--protection-step-spreads", type=float, default=0.10)
+    parser.add_argument("--max-same-side", type=int, default=30)
+    parser.add_argument("--max-entries-per-second", type=int, default=8)
+    parser.add_argument("--max-session-loss-usd", type=float, default=30.0)
+    parser.add_argument("--max-aggregate-emergency-risk-usd", type=float, default=30.0)
+    parser.add_argument("--break-even-trigger-spreads", type=float, default=0.65)
+    parser.add_argument("--profit-lock-trigger-spreads", type=float, default=0.85)
+    parser.add_argument("--profit-lock-spreads", type=float, default=0.20)
+    parser.add_argument("--trailing-trigger-spreads", type=float, default=1.00)
+    parser.add_argument("--trailing-distance-spreads", type=float, default=0.45)
     parser.add_argument("--poll-ms", type=int, default=10)
-    parser.add_argument("--status-seconds", type=float, default=15.0)
+    parser.add_argument("--status-seconds", type=float, default=10.0)
     args = parser.parse_args()
 
     if os.getenv("MT5_MODE", "demo").lower() != "demo":
@@ -264,38 +227,38 @@ def main() -> None:
             "Refusing to trade. Set BBYG_AUTONOMOUS_DEMO_CONFIRM=I_UNDERSTAND_EXPERIMENTAL_DEMO "
             "after confirming the intended MT5 account is DEMO."
         )
-    if not 0.51 <= args.threshold <= 0.75:
-        raise SystemExit("--threshold must be between 0.51 and 0.75")
+    if not 0.50 < args.threshold <= 0.75:
+        raise SystemExit("--threshold must be in (0.50, 0.75]")
+    if not 0.50 < args.exit_reversal_threshold <= 0.75:
+        raise SystemExit("--exit-reversal-threshold must be in (0.50, 0.75]")
+    if not 0.50 <= args.edge_fade_threshold <= 0.75:
+        raise SystemExit("--edge-fade-threshold must be in [0.50, 0.75]")
+    if args.edge_fade_min_profit_spreads < 0:
+        raise SystemExit("--edge-fade-min-profit-spreads must be non-negative")
     if not 0 < args.size <= 0.01:
         raise SystemExit("--size must be in (0, 0.01]")
+    if not 1 <= args.entries_per_signal <= 10:
+        raise SystemExit("--entries-per-signal must be between 1 and 10")
     if not 0.05 <= args.hours <= 8:
         raise SystemExit("--hours must be between 0.05 and 8")
-    if not 1 <= args.max_trades <= 1000:
-        raise SystemExit("--max-trades must be between 1 and 1000")
+    if not 1 <= args.max_trades <= 2000:
+        raise SystemExit("--max-trades must be between 1 and 2000")
     if not 1 <= args.max_open_positions <= 50:
         raise SystemExit("--max-open-positions must be between 1 and 50")
     if not 1 <= args.max_same_side <= args.max_open_positions:
         raise SystemExit("--max-same-side must be between 1 and --max-open-positions")
-    if not 1 <= args.max_entries_per_second <= 10:
-        raise SystemExit("--max-entries-per-second must be between 1 and 10")
-    if not 0 < args.max_session_loss_usd <= 50:
-        raise SystemExit("--max-session-loss-usd must be in (0, 50]")
-    if not 0 < args.max_aggregate_emergency_risk_usd <= 25:
-        raise SystemExit("--max-aggregate-emergency-risk-usd must be in (0, 25]")
-    if not 0 < args.break_even_trigger_spreads < args.profit_lock_trigger_spreads:
-        raise SystemExit("break-even trigger must be positive and below profit-lock trigger")
-    if not args.break_even_trigger_spreads < args.profit_lock_trigger_spreads < args.trailing_trigger_spreads:
-        raise SystemExit("protection triggers must increase: break-even < profit-lock < trailing")
+    if not 1 <= args.max_entries_per_second <= 20:
+        raise SystemExit("--max-entries-per-second must be between 1 and 20")
+    if not 0 < args.max_session_loss_usd <= 100:
+        raise SystemExit("--max-session-loss-usd must be in (0, 100]")
+    if not 0 < args.max_aggregate_emergency_risk_usd <= 100:
+        raise SystemExit("--max-aggregate-emergency-risk-usd must be in (0, 100]")
+    if not 0 < args.break_even_trigger_spreads < args.profit_lock_trigger_spreads < args.trailing_trigger_spreads:
+        raise SystemExit("Require break-even < profit-lock < trailing trigger")
     if not 0 <= args.profit_lock_spreads < args.profit_lock_trigger_spreads:
-        raise SystemExit("profit-lock spreads must be non-negative and below its trigger")
+        raise SystemExit("invalid profit lock")
     if not 0 < args.trailing_distance_spreads < args.trailing_trigger_spreads:
-        raise SystemExit("trailing distance must be positive and below trailing trigger")
-    if not 0 < args.protection_step_spreads <= 0.5:
-        raise SystemExit("protection step must be in (0, 0.5]")
-    if not 5 <= args.poll_ms <= 1000:
-        raise SystemExit("--poll-ms must be between 5 and 1000")
-    if args.status_seconds <= 0:
-        raise SystemExit("--status-seconds must be positive")
+        raise SystemExit("invalid trailing distance")
 
     settings = DemoMT5Settings.from_env()
     state_dir = Path(os.getenv("BBYG_STATE_DIR", "data/bbyg-multiday-v1"))
@@ -322,7 +285,6 @@ def main() -> None:
     trades_opened = 0
     trades_closed = 0
     realized_pnl = 0.0
-    aggregate_emergency_risk = 0.0
     last_p_long: float | None = None
     last_confidence: float | None = None
     max_confidence_seen = 0.0
@@ -342,11 +304,14 @@ def main() -> None:
             experimental=True,
             demo_only=True,
             multi_position=True,
-            profit_protection=True,
+            algorithmic_exits=True,
+            broker_stop_role="emergency_fail_safe_only",
             login=int(account.login),
             server=str(account.server),
             symbol=broker.symbol,
             threshold=args.threshold,
+            exit_reversal_threshold=args.exit_reversal_threshold,
+            entries_per_signal=args.entries_per_signal,
             size=args.size,
             max_trades=args.max_trades,
             max_open_positions=args.max_open_positions,
@@ -354,12 +319,6 @@ def main() -> None:
             max_entries_per_second=args.max_entries_per_second,
             max_session_loss_usd=args.max_session_loss_usd,
             max_aggregate_emergency_risk_usd=args.max_aggregate_emergency_risk_usd,
-            break_even_trigger_spreads=args.break_even_trigger_spreads,
-            profit_lock_trigger_spreads=args.profit_lock_trigger_spreads,
-            profit_lock_spreads=args.profit_lock_spreads,
-            trailing_trigger_spreads=args.trailing_trigger_spreads,
-            trailing_distance_spreads=args.trailing_distance_spreads,
-            start_equity=start_equity,
             training_samples=len(train_x),
             training_long_fraction=float(np.mean(train_y)),
         )
@@ -394,7 +353,7 @@ def main() -> None:
             tick_no += 1
             segment_tick_no += 1
 
-            # Reconcile every managed position by stable identifier before new writes.
+            # Reconcile broker-side closures before any new write.
             for ticket in list(active):
                 trade = active.get(ticket)
                 if trade is None:
@@ -411,13 +370,11 @@ def main() -> None:
                     realized_pnl += pnl
                     trades_closed += 1
                     emit(
-                        "broker_closed",
+                        "broker_emergency_closed",
                         ticket=ticket,
                         side=trade.side.value,
                         net_pnl_usd=pnl,
                         session_net_pnl_usd=realized_pnl,
-                        protection_stage=trade.protection_stage,
-                        peak_favorable_spreads=trade.peak_favorable_spreads,
                         outcome=outcome,
                     )
                 elif current_ticket != ticket:
@@ -427,13 +384,26 @@ def main() -> None:
                     emit("position_ticket_reconciled", old_ticket=ticket,
                          new_ticket=current_ticket, identifier=trade.identifier)
 
-            # First protect profitable positions, then evaluate exits independently.
+            # Build/update the causal model score before managing algorithmic exits.
+            new_model_score = False
+            features = feature_engine.update(tick)
+            if features is not None and (segment_tick_no - FEATURE_WINDOW) % STRIDE == 0:
+                anchors_evaluated += 1
+                p_long = float(model.probability(scaler.transform(
+                    np.asarray([features.vector()], dtype=float)
+                ))[0])
+                confidence = max(p_long, 1.0 - p_long)
+                last_p_long = p_long
+                last_confidence = confidence
+                max_confidence_seen = max(max_confidence_seen, confidence)
+                new_model_score = True
+
+            # Software-only profit protection and model-driven exits.
             for ticket in list(active):
                 trade = active.get(ticket)
                 if trade is None:
                     continue
-                maybe_tighten_profit_stop(
-                    broker,
+                update_algorithmic_protection(
                     trade,
                     tick,
                     break_even_trigger=args.break_even_trigger_spreads,
@@ -441,26 +411,22 @@ def main() -> None:
                     profit_lock_spreads=args.profit_lock_spreads,
                     trailing_trigger=args.trailing_trigger_spreads,
                     trailing_distance_spreads=args.trailing_distance_spreads,
-                    protection_step_spreads=args.protection_step_spreads,
                 )
-
-            for ticket in list(active):
-                trade = active.get(ticket)
-                if trade is None:
-                    continue
+                fav = favorable_spreads(trade, tick)
                 reason = None
-                if trade.side is Side.LONG:
-                    if tick.bid <= trade.stop:
-                        reason = "protected_stop" if trade.protection_stage else "strategy_stop"
-                    elif tick.bid >= trade.target:
-                        reason = "strategy_target"
-                else:
-                    if tick.ask >= trade.stop:
-                        reason = "protected_stop" if trade.protection_stage else "strategy_stop"
-                    elif tick.ask <= trade.target:
-                        reason = "strategy_target"
+
+                if trade.algo_floor_spreads is not None and fav <= trade.algo_floor_spreads:
+                    reason = "algorithmic_profit_protection"
+                elif new_model_score and last_p_long is not None:
+                    dir_p = directional_probability(trade.side, last_p_long)
+                    opposite_p = 1.0 - dir_p
+                    if opposite_p >= args.exit_reversal_threshold:
+                        reason = "model_reversal"
+                    elif fav >= args.edge_fade_min_profit_spreads and dir_p < args.edge_fade_threshold:
+                        reason = "profitable_edge_fade"
                 if reason is None and tick_no - trade.entry_tick_no >= MAX_HOLD_TICKS:
-                    reason = "strategy_horizon"
+                    reason = "algorithmic_horizon"
+
                 if reason is not None:
                     pnl = close_trade(broker, trade, tick, reason)
                     active.pop(trade.ticket, None)
@@ -468,49 +434,65 @@ def main() -> None:
                     realized_pnl += pnl
                     trades_closed += 1
 
-            # Conservative aggregate emergency-stop risk. Tightened stops may make true risk lower.
-            if active:
-                info = broker._symbol_info()
-                risks = []
-                for trade in active.values():
-                    expected = tick.ask if trade.side is Side.LONG else tick.bid
-                    _, risk = broker._risk_checked_stop(trade.side, args.size, expected, info)
-                    risks.append(float(risk))
-                aggregate_emergency_risk = float(sum(risks))
-            else:
-                aggregate_emergency_risk = 0.0
-
+            aggregate_emergency_risk = float(sum(t.emergency_risk_usd for t in active.values()))
             while entry_times and tick.ts_ns - entry_times[0] >= 1_000_000_000:
                 entry_times.popleft()
 
-            # Every selected model signal may create its own independent position.
+            # A selected score creates N independent tickets (fanout), all still bounded by risk/rate/portfolio caps.
+            if new_model_score and last_p_long is not None and last_confidence is not None:
+                if last_confidence >= args.threshold and trades_opened < args.max_trades:
+                    side = Side.LONG if last_p_long >= 0.5 else Side.SHORT
+                    signals += 1
+                    for copy_no in range(1, args.entries_per_signal + 1):
+                        pending.append(PendingEntry(
+                            side=side,
+                            signal_ts_ns=tick.ts_ns,
+                            probability_long=last_p_long,
+                            confidence=last_confidence,
+                            signal_no=signals,
+                            copy_no=copy_no,
+                        ))
+                    emit(
+                        "signal",
+                        side=side.value,
+                        probability_long=last_p_long,
+                        confidence=last_confidence,
+                        threshold=args.threshold,
+                        signal_no=signals,
+                        fanout=args.entries_per_signal,
+                        queued_signals=len(pending),
+                        open_positions=len(active),
+                    )
+
+            # Execute queued entries on strictly later ticks. Rate-limited items are carried, not discarded.
+            carry: deque[PendingEntry] = deque()
             queued = len(pending)
             for _ in range(queued):
                 signal = pending.popleft()
                 delay_ns = tick.ts_ns - signal.signal_ts_ns
                 if delay_ns <= 0:
-                    pending.append(signal)
+                    carry.append(signal)
                     continue
                 if delay_ns > MAX_ENTRY_DELAY_NS or trades_opened >= args.max_trades:
                     continue
                 if len(active) >= args.max_open_positions:
+                    carry.append(signal)
                     continue
                 if sum(1 for t in active.values() if t.side is signal.side) >= args.max_same_side:
+                    carry.append(signal)
                     continue
+                while entry_times and tick.ts_ns - entry_times[0] >= 1_000_000_000:
+                    entry_times.popleft()
                 if len(entry_times) >= args.max_entries_per_second:
+                    carry.append(signal)
                     continue
 
                 info = broker._symbol_info()
                 expected = tick.ask if signal.side is Side.LONG else tick.bid
                 _, candidate_risk = broker._risk_checked_stop(signal.side, args.size, expected, info)
+                aggregate_emergency_risk = float(sum(t.emergency_risk_usd for t in active.values()))
                 if aggregate_emergency_risk + candidate_risk > args.max_aggregate_emergency_risk_usd + 1e-9:
-                    emit(
-                        "entry_blocked",
-                        reason="aggregate_risk_cap",
-                        open_positions=len(active),
-                        aggregate_risk_usd=aggregate_emergency_risk,
-                        candidate_risk_usd=candidate_risk,
-                    )
+                    carry.append(signal)
                     continue
 
                 opened = broker.open(signal.side, args.size, decision_id("open", tick.ts_ns, signal.side))
@@ -522,68 +504,37 @@ def main() -> None:
                     raise ExecutionUncertain("opened position not observable")
                 spread = max(tick.spread, 1e-12)
                 entry = float(pos.entry)
-                if signal.side is Side.LONG:
-                    target = entry + TARGET_SPREADS * spread
-                    stop = entry - INITIAL_STOP_SPREADS * spread
-                else:
-                    target = entry - TARGET_SPREADS * spread
-                    stop = entry + INITIAL_STOP_SPREADS * spread
-                active[opened.position_id] = ActiveTrade(
+                trade = ActiveTrade(
                     ticket=opened.position_id,
                     identifier=int(opened.position_identifier),
                     side=signal.side,
                     entry=entry,
                     entry_spread=spread,
-                    target=float(target),
-                    stop=float(stop),
                     entry_tick_no=tick_no,
                     opened_ns=tick.ts_ns,
-                    protected_stop=pos.broker_stop,
+                    emergency_risk_usd=float(opened.risk_amount or candidate_risk),
+                    signal_no=signal.signal_no,
+                    copy_no=signal.copy_no,
                 )
+                active[trade.ticket] = trade
                 trades_opened += 1
                 entry_times.append(tick.ts_ns)
-                aggregate_emergency_risk += float(opened.risk_amount or candidate_risk)
                 emit(
                     "opened",
                     side=signal.side.value,
                     confidence=signal.confidence,
                     probability_long=signal.probability_long,
-                    ticket=opened.position_id,
+                    signal_no=signal.signal_no,
+                    copy_no=signal.copy_no,
+                    ticket=trade.ticket,
                     entry=entry,
-                    target=target,
-                    strategy_stop=stop,
                     broker_emergency_stop=pos.broker_stop,
-                    emergency_broker_stop_risk_usd=opened.risk_amount,
-                    aggregate_emergency_risk_usd=aggregate_emergency_risk,
+                    emergency_broker_stop_risk_usd=trade.emergency_risk_usd,
+                    aggregate_emergency_risk_usd=sum(t.emergency_risk_usd for t in active.values()),
                     open_positions=len(active),
                     trades_opened=trades_opened,
                 )
-
-            features = feature_engine.update(tick)
-            if features is not None and trades_opened < args.max_trades:
-                if (segment_tick_no - FEATURE_WINDOW) % STRIDE == 0:
-                    anchors_evaluated += 1
-                    p_long = float(model.probability(scaler.transform(
-                        np.asarray([features.vector()], dtype=float)
-                    ))[0])
-                    confidence = max(p_long, 1.0 - p_long)
-                    last_p_long = p_long
-                    last_confidence = confidence
-                    max_confidence_seen = max(max_confidence_seen, confidence)
-                    if confidence >= args.threshold:
-                        side = Side.LONG if p_long >= 0.5 else Side.SHORT
-                        pending.append(PendingEntry(side, tick.ts_ns, p_long, confidence))
-                        signals += 1
-                        emit(
-                            "signal",
-                            side=side.value,
-                            probability_long=p_long,
-                            confidence=confidence,
-                            threshold=args.threshold,
-                            signals=signals,
-                            queued_signals=len(pending),
-                            open_positions=len(active),
-                        )
+            pending = carry
 
             now = time.monotonic()
             if now - last_status_monotonic >= args.status_seconds:
@@ -596,17 +547,17 @@ def main() -> None:
                     max_confidence_seen=max_confidence_seen,
                     threshold=args.threshold,
                     signals=signals,
-                    queued_signals=len(pending),
+                    queued_entries=len(pending),
                     open_positions=len(active),
                     long_positions=sum(1 for t in active.values() if t.side is Side.LONG),
                     short_positions=sum(1 for t in active.values() if t.side is Side.SHORT),
-                    protected_positions=sum(1 for t in active.values() if t.protection_stage > 0),
-                    trailing_positions=sum(1 for t in active.values() if t.protection_stage >= 3),
+                    protected_positions=sum(1 for t in active.values() if t.algo_floor_spreads is not None),
+                    trailing_positions=sum(1 for t in active.values() if t.protection_stage == "trailing"),
                     trades_opened=trades_opened,
                     trades_closed=trades_closed,
                     realized_pnl_usd=realized_pnl,
                     equity=broker.account_equity(),
-                    aggregate_emergency_risk_usd=aggregate_emergency_risk,
+                    aggregate_emergency_risk_usd=sum(t.emergency_risk_usd for t in active.values()),
                 )
                 last_status_monotonic = now
 
@@ -652,7 +603,7 @@ def main() -> None:
         demo_only=True,
         experimental=True,
         multi_position=True,
-        profit_protection=True,
+        algorithmic_exits=True,
         signals=signals,
         anchors_evaluated=anchors_evaluated,
         max_confidence_seen=max_confidence_seen,
