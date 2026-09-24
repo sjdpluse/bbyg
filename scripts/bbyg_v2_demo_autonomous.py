@@ -11,7 +11,12 @@ import time
 
 import numpy as np
 
-from truetrade.scalper.execution import DemoMT5Settings, ExecutionRejected, ExecutionUncertain
+from truetrade.scalper.execution import (
+    DemoMT5Settings,
+    ExecutionRejected,
+    ExecutionResult,
+    ExecutionUncertain,
+)
 from truetrade.scalper.features import TickFeatureEngine
 from truetrade.scalper.research_models import RobustScaler, fit_logit
 from truetrade.scalper.store import ScalperStore
@@ -44,7 +49,7 @@ class ActiveTrade:
     entry_spread: float
     entry_tick_no: int
     opened_ns: int
-    emergency_risk_usd: float
+    risk_budget_usd: float
     signal_no: int
     copy_no: int
     peak_favorable_spreads: float = 0.0
@@ -158,7 +163,7 @@ def update_algorithmic_protection(
     trailing_trigger: float,
     trailing_distance_spreads: float,
 ) -> None:
-    """Software-only profit protection. It does not modify the broker SL."""
+    """Software-only profit protection. It never writes SL/TP to MT5."""
     fav = favorable_spreads(trade, tick)
     trade.peak_favorable_spreads = max(trade.peak_favorable_spreads, fav)
     peak = trade.peak_favorable_spreads
@@ -192,23 +197,107 @@ def update_algorithmic_protection(
         )
 
 
+def estimate_algorithmic_loss_usd(
+    broker: TimeNormalizedDemoMT5Execution,
+    side: Side,
+    volume: float,
+    entry: float,
+    spread: float,
+    loss_cut_spreads: float,
+) -> float:
+    loss_price = (entry - loss_cut_spreads * spread
+                  if side is Side.LONG
+                  else entry + loss_cut_spreads * spread)
+    kind = broker.api.ORDER_TYPE_BUY if side is Side.LONG else broker.api.ORDER_TYPE_SELL
+    pnl = broker.call("order_calc_profit", kind, broker.symbol, volume, entry, loss_price)
+    risk = max(0.0, -float(pnl)) + volume * broker.settings.commission_per_lot
+    if risk <= 0 or not np.isfinite(risk):
+        raise ExecutionRejected("invalid algorithmic loss-risk estimate")
+    return float(risk)
+
+
+def open_algorithmic_only_demo(
+    broker: TimeNormalizedDemoMT5Execution,
+    side: Side,
+    size: float,
+    decision: str,
+    *,
+    loss_cut_spreads: float,
+) -> tuple[ExecutionResult, float, float]:
+    """Open a DEMO position without broker SL/TP.
+
+    This is intentionally isolated to the experimental DEMO runner. The broker account
+    is still re-validated as DEMO before the write, but all strategy exits are software
+    market closes. The returned risk number is a hypothetical software-loss-cut estimate,
+    not a broker-guaranteed stop risk.
+    """
+    broker._account(trading=True)
+    broker._clean_for_entry()
+    info = broker._symbol_info()
+    tick = broker._fresh_tick_for_write()
+    if tick.spread / float(info.point) > broker.settings.max_spread_points:
+        raise ExecutionRejected("spread limit exceeded")
+    volume = broker._normalized_volume(size, info)
+    expected = tick.ask if side is Side.LONG else tick.bid
+    software_risk = estimate_algorithmic_loss_usd(
+        broker, side, volume, expected, max(tick.spread, 1e-12), loss_cut_spreads
+    )
+    request = broker._request(info, side, volume, expected, decision_id=decision, stop=None)
+    start = time.perf_counter_ns()
+    result = broker._send_once(request)
+    end = time.perf_counter_ns()
+    deal, identifier = broker._verify_deal(result, side)
+    matches = [p for p in broker.call("positions_get")
+               if p.symbol == broker.symbol and p.magic == broker.settings.magic and p.identifier == identifier]
+    if len(matches) != 1:
+        raise ExecutionUncertain("filled position not uniquely observable")
+    p = matches[0]
+    if abs(float(p.volume) - volume) > max(float(info.volume_step) / 2, 1e-12):
+        raise ExecutionUncertain("unexpected fill volume")
+    # In algorithmic-only mode a broker SL/TP must not be attached.
+    if float(getattr(p, "sl", 0.0) or 0.0) > 0 or float(getattr(p, "tp", 0.0) or 0.0) > 0:
+        raise ExecutionUncertain("unexpected broker SL/TP in algorithmic-only mode")
+    execution = ExecutionResult(
+        decision,
+        "OPEN",
+        str(p.ticket),
+        float(deal.volume),
+        expected,
+        float(deal.price),
+        int(result.order),
+        int(result.deal),
+        start,
+        end,
+        position_identifier=identifier,
+        risk_amount=software_risk,
+    )
+    return execution, software_risk, max(tick.spread, 1e-12)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="EXPERIMENTAL multi-position BBYG v2 MT5 DEMO runner with algorithmic exits."
+        description="EXPERIMENTAL multi-position BBYG v2 MT5 DEMO runner with fully algorithmic exits."
     )
     parser.add_argument("--hours", type=float, default=2.0)
     parser.add_argument("--threshold", type=float, default=0.52)
     parser.add_argument("--exit-reversal-threshold", type=float, default=0.55)
     parser.add_argument("--edge-fade-threshold", type=float, default=0.52)
     parser.add_argument("--edge-fade-min-profit-spreads", type=float, default=0.35)
+    parser.add_argument("--algorithmic-loss-cut-spreads", type=float, default=3.0)
     parser.add_argument("--size", type=float, default=0.01)
-    parser.add_argument("--entries-per-signal", type=int, default=4)
+    parser.add_argument("--entries-per-signal", type=int, default=5)
     parser.add_argument("--max-trades", type=int, default=500)
     parser.add_argument("--max-open-positions", type=int, default=30)
     parser.add_argument("--max-same-side", type=int, default=30)
     parser.add_argument("--max-entries-per-second", type=int, default=8)
     parser.add_argument("--max-session-loss-usd", type=float, default=30.0)
-    parser.add_argument("--max-aggregate-emergency-risk-usd", type=float, default=30.0)
+    parser.add_argument(
+        "--max-aggregate-risk-usd",
+        "--max-aggregate-emergency-risk-usd",
+        dest="max_aggregate_risk_usd",
+        type=float,
+        default=30.0,
+    )
     parser.add_argument("--break-even-trigger-spreads", type=float, default=0.65)
     parser.add_argument("--profit-lock-trigger-spreads", type=float, default=0.85)
     parser.add_argument("--profit-lock-spreads", type=float, default=0.20)
@@ -227,6 +316,11 @@ def main() -> None:
             "Refusing to trade. Set BBYG_AUTONOMOUS_DEMO_CONFIRM=I_UNDERSTAND_EXPERIMENTAL_DEMO "
             "after confirming the intended MT5 account is DEMO."
         )
+    if os.getenv("BBYG_ALGO_ONLY_DEMO_CONFIRM", "") != "I_ACCEPT_NO_BROKER_STOP_DEMO_ONLY":
+        raise SystemExit(
+            "Refusing algorithmic-only mode. Set "
+            "BBYG_ALGO_ONLY_DEMO_CONFIRM=I_ACCEPT_NO_BROKER_STOP_DEMO_ONLY."
+        )
     if not 0.50 < args.threshold <= 0.75:
         raise SystemExit("--threshold must be in (0.50, 0.75]")
     if not 0.50 < args.exit_reversal_threshold <= 0.75:
@@ -235,6 +329,8 @@ def main() -> None:
         raise SystemExit("--edge-fade-threshold must be in [0.50, 0.75]")
     if args.edge_fade_min_profit_spreads < 0:
         raise SystemExit("--edge-fade-min-profit-spreads must be non-negative")
+    if not 0.5 <= args.algorithmic_loss_cut_spreads <= 10.0:
+        raise SystemExit("--algorithmic-loss-cut-spreads must be between 0.5 and 10")
     if not 0 < args.size <= 0.01:
         raise SystemExit("--size must be in (0, 0.01]")
     if not 1 <= args.entries_per_signal <= 10:
@@ -251,8 +347,8 @@ def main() -> None:
         raise SystemExit("--max-entries-per-second must be between 1 and 20")
     if not 0 < args.max_session_loss_usd <= 100:
         raise SystemExit("--max-session-loss-usd must be in (0, 100]")
-    if not 0 < args.max_aggregate_emergency_risk_usd <= 100:
-        raise SystemExit("--max-aggregate-emergency-risk-usd must be in (0, 100]")
+    if not 0 < args.max_aggregate_risk_usd <= 100:
+        raise SystemExit("--max-aggregate-risk-usd must be in (0, 100]")
     if not 0 < args.break_even_trigger_spreads < args.profit_lock_trigger_spreads < args.trailing_trigger_spreads:
         raise SystemExit("Require break-even < profit-lock < trailing trigger")
     if not 0 <= args.profit_lock_spreads < args.profit_lock_trigger_spreads:
@@ -305,12 +401,15 @@ def main() -> None:
             demo_only=True,
             multi_position=True,
             algorithmic_exits=True,
-            broker_stop_role="emergency_fail_safe_only",
+            broker_stop_role="none",
+            broker_tp_role="none",
+            crash_protection=False,
             login=int(account.login),
             server=str(account.server),
             symbol=broker.symbol,
             threshold=args.threshold,
             exit_reversal_threshold=args.exit_reversal_threshold,
+            algorithmic_loss_cut_spreads=args.algorithmic_loss_cut_spreads,
             entries_per_signal=args.entries_per_signal,
             size=args.size,
             max_trades=args.max_trades,
@@ -318,7 +417,7 @@ def main() -> None:
             max_same_side=args.max_same_side,
             max_entries_per_second=args.max_entries_per_second,
             max_session_loss_usd=args.max_session_loss_usd,
-            max_aggregate_emergency_risk_usd=args.max_aggregate_emergency_risk_usd,
+            max_aggregate_risk_usd=args.max_aggregate_risk_usd,
             training_samples=len(train_x),
             training_long_fraction=float(np.mean(train_y)),
         )
@@ -353,7 +452,7 @@ def main() -> None:
             tick_no += 1
             segment_tick_no += 1
 
-            # Reconcile broker-side closures before any new write.
+            # With no broker SL/TP, a disappearance is still reconciled in case of a manual close.
             for ticket in list(active):
                 trade = active.get(ticket)
                 if trade is None:
@@ -370,7 +469,7 @@ def main() -> None:
                     realized_pnl += pnl
                     trades_closed += 1
                     emit(
-                        "broker_emergency_closed",
+                        "externally_closed",
                         ticket=ticket,
                         side=trade.side.value,
                         net_pnl_usd=pnl,
@@ -384,7 +483,6 @@ def main() -> None:
                     emit("position_ticket_reconciled", old_ticket=ticket,
                          new_ticket=current_ticket, identifier=trade.identifier)
 
-            # Build/update the causal model score before managing algorithmic exits.
             new_model_score = False
             features = feature_engine.update(tick)
             if features is not None and (segment_tick_no - FEATURE_WINDOW) % STRIDE == 0:
@@ -398,7 +496,7 @@ def main() -> None:
                 max_confidence_seen = max(max_confidence_seen, confidence)
                 new_model_score = True
 
-            # Software-only profit protection and model-driven exits.
+            # Profit AND loss exits are software market closes. MT5 carries no SL or TP.
             for ticket in list(active):
                 trade = active.get(ticket)
                 if trade is None:
@@ -417,6 +515,8 @@ def main() -> None:
 
                 if trade.algo_floor_spreads is not None and fav <= trade.algo_floor_spreads:
                     reason = "algorithmic_profit_protection"
+                elif fav <= -args.algorithmic_loss_cut_spreads:
+                    reason = "algorithmic_loss_cut"
                 elif new_model_score and last_p_long is not None:
                     dir_p = directional_probability(trade.side, last_p_long)
                     opposite_p = 1.0 - dir_p
@@ -434,11 +534,10 @@ def main() -> None:
                     realized_pnl += pnl
                     trades_closed += 1
 
-            aggregate_emergency_risk = float(sum(t.emergency_risk_usd for t in active.values()))
+            aggregate_risk = float(sum(t.risk_budget_usd for t in active.values()))
             while entry_times and tick.ts_ns - entry_times[0] >= 1_000_000_000:
                 entry_times.popleft()
 
-            # A selected score creates N independent tickets (fanout), all still bounded by risk/rate/portfolio caps.
             if new_model_score and last_p_long is not None and last_confidence is not None:
                 if last_confidence >= args.threshold and trades_opened < args.max_trades:
                     side = Side.LONG if last_p_long >= 0.5 else Side.SHORT
@@ -460,11 +559,10 @@ def main() -> None:
                         threshold=args.threshold,
                         signal_no=signals,
                         fanout=args.entries_per_signal,
-                        queued_signals=len(pending),
+                        queued_entries=len(pending),
                         open_positions=len(active),
                     )
 
-            # Execute queued entries on strictly later ticks. Rate-limited items are carried, not discarded.
             carry: deque[PendingEntry] = deque()
             queued = len(pending)
             for _ in range(queued):
@@ -488,31 +586,45 @@ def main() -> None:
                     continue
 
                 info = broker._symbol_info()
-                expected = tick.ask if signal.side is Side.LONG else tick.bid
-                _, candidate_risk = broker._risk_checked_stop(signal.side, args.size, expected, info)
-                aggregate_emergency_risk = float(sum(t.emergency_risk_usd for t in active.values()))
-                if aggregate_emergency_risk + candidate_risk > args.max_aggregate_emergency_risk_usd + 1e-9:
+                volume = broker._normalized_volume(args.size, info)
+                fresh = broker._fresh_tick_for_write()
+                expected = fresh.ask if signal.side is Side.LONG else fresh.bid
+                spread = max(fresh.spread, 1e-12)
+                candidate_risk = estimate_algorithmic_loss_usd(
+                    broker,
+                    signal.side,
+                    volume,
+                    expected,
+                    spread,
+                    args.algorithmic_loss_cut_spreads,
+                )
+                aggregate_risk = float(sum(t.risk_budget_usd for t in active.values()))
+                if aggregate_risk + candidate_risk > args.max_aggregate_risk_usd + 1e-9:
                     carry.append(signal)
                     continue
 
-                opened = broker.open(signal.side, args.size, decision_id("open", tick.ts_ns, signal.side))
+                opened, software_risk, observed_spread = open_algorithmic_only_demo(
+                    broker,
+                    signal.side,
+                    args.size,
+                    decision_id("open", tick.ts_ns, signal.side),
+                    loss_cut_spreads=args.algorithmic_loss_cut_spreads,
+                )
                 if opened.position_id is None or opened.position_identifier is None:
                     raise ExecutionUncertain("open result missing position identity")
                 positions = broker.positions()
                 pos = next((p for p in positions if p.position_id == opened.position_id), None)
                 if pos is None:
                     raise ExecutionUncertain("opened position not observable")
-                spread = max(tick.spread, 1e-12)
-                entry = float(pos.entry)
                 trade = ActiveTrade(
                     ticket=opened.position_id,
                     identifier=int(opened.position_identifier),
                     side=signal.side,
-                    entry=entry,
-                    entry_spread=spread,
+                    entry=float(pos.entry),
+                    entry_spread=observed_spread,
                     entry_tick_no=tick_no,
                     opened_ns=tick.ts_ns,
-                    emergency_risk_usd=float(opened.risk_amount or candidate_risk),
+                    risk_budget_usd=software_risk,
                     signal_no=signal.signal_no,
                     copy_no=signal.copy_no,
                 )
@@ -527,10 +639,12 @@ def main() -> None:
                     signal_no=signal.signal_no,
                     copy_no=signal.copy_no,
                     ticket=trade.ticket,
-                    entry=entry,
-                    broker_emergency_stop=pos.broker_stop,
-                    emergency_broker_stop_risk_usd=trade.emergency_risk_usd,
-                    aggregate_emergency_risk_usd=sum(t.emergency_risk_usd for t in active.values()),
+                    entry=trade.entry,
+                    broker_stop=None,
+                    broker_tp=None,
+                    algorithmic_loss_cut_spreads=args.algorithmic_loss_cut_spreads,
+                    estimated_algorithmic_risk_usd=software_risk,
+                    aggregate_risk_usd=sum(t.risk_budget_usd for t in active.values()),
                     open_positions=len(active),
                     trades_opened=trades_opened,
                 )
@@ -557,7 +671,7 @@ def main() -> None:
                     trades_closed=trades_closed,
                     realized_pnl_usd=realized_pnl,
                     equity=broker.account_equity(),
-                    aggregate_emergency_risk_usd=sum(t.emergency_risk_usd for t in active.values()),
+                    aggregate_risk_usd=sum(t.risk_budget_usd for t in active.values()),
                 )
                 last_status_monotonic = now
 
@@ -604,6 +718,8 @@ def main() -> None:
         experimental=True,
         multi_position=True,
         algorithmic_exits=True,
+        broker_stop_role="none",
+        broker_tp_role="none",
         signals=signals,
         anchors_evaluated=anchors_evaluated,
         max_confidence_seen=max_confidence_seen,
