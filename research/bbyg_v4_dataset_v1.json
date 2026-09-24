@@ -1,0 +1,50 @@
+{
+  "protocol": "bbyg_v4_episode_dataset_v1",
+  "created_utc_date": "2026-09-24",
+  "execution_authorized": false,
+  "builder_version": "bbyg-v4-offline-episodes-1",
+  "source": {
+    "instrument": "XAUUSD",
+    "tick_count": 2890440,
+    "min_ts_ns": 1789505207731000000,
+    "max_ts_ns": 1790235122630000000,
+    "segments": 8,
+    "max_gap_ns": 300000000000
+  },
+  "episode_contract": {
+    "stride": 16,
+    "horizon_ticks": 600,
+    "risk_spreads": 2.0,
+    "extra_cost_spreads": 0.2,
+    "feature_dimensions": 47,
+    "policy_independent": true,
+    "proposal": "FLAT",
+    "entry_semantics": "first_strictly_later_executable_bid_ask"
+  },
+  "dataset": {
+    "episode_count": 179077,
+    "dataset_signature": "e33aab1d8981272729c3ae5774b31f77f10d7856620b8d215615fbbc3889d28a",
+    "dataset_digest": "be768cf3bdd3a777be1be4248817e14887bcbe2d6c388c242bdab2d87e390baa",
+    "regimes": {
+      "range": 70687,
+      "shock": 2164,
+      "trend_down": 54395,
+      "trend_up": 51831
+    }
+  },
+  "verification": {
+    "v4_tests": "13/13 passed",
+    "independent_replay_parity": true,
+    "expected_count": 179077,
+    "actual_count": 179077,
+    "expected_digest": "be768cf3bdd3a777be1be4248817e14887bcbe2d6c388c242bdab2d87e390baa",
+    "actual_digest": "be768cf3bdd3a777be1be4248817e14887bcbe2d6c388c242bdab2d87e390baa"
+  },
+  "split_status": "not_frozen",
+  "notes": [
+    "This manifest freezes the first parity-verified BBYG v4 policy-independent episode dataset.",
+    "No train/calibration/validation split is frozen until per-day coverage and reward diagnostics are reviewed.",
+    "A future encoder or reward-contract change must create a new dataset version/signature rather than silently replacing this manifest.",
+    "This dataset manifest does not authorize DEMO or live execution."
+  ]
+}
