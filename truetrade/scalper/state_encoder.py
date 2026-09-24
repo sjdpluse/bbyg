@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import math
-from typing import Iterable
 
 import numpy as np
 
@@ -258,9 +257,10 @@ def _frame_snapshot(bars: list[_Bar], spread: float) -> _FrameSnapshot:
 class MarketStateEncoder:
     """Causal multi-timescale market state used by BBYG v4.
 
-    Replay and live code must both feed ticks sequentially through this class.  No candle
+    Replay and live code must both feed ticks sequentially through this class. No candle
     is synthesized for missing time buckets, and the current partial candle contains only
-    information observable up to the current tick.
+    information observable up to the current tick. `compute=False` advances all causal
+    bar state without materializing an embedding; this is used by strided offline replay.
     """
 
     MIN_BARS = {1: 30, 5: 24, 60: 16}
@@ -291,13 +291,14 @@ class MarketStateEncoder:
         micro: MicroFeatures | None,
         *,
         execution: ExecutionContext | None = None,
+        compute: bool = True,
     ) -> MarketState | None:
         if self.last_ts_ns and tick.ts_ns <= self.last_ts_ns:
             raise ValueError("ticks must be strictly increasing")
         self.last_ts_ns = tick.ts_ns
         for frame in self.frames.values():
             frame.update(tick)
-        if micro is None:
+        if micro is None or not compute:
             return None
 
         snapshots: dict[int, _FrameSnapshot] = {}
