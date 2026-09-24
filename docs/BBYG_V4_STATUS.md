@@ -78,6 +78,8 @@ The state encoder also classifies a coarse causal regime:
 
 Important parity rule: replay and live must both feed sequential ticks through the same encoder. Missing buckets are not fabricated and the current partial bar contains only observations already received.
 
+The encoder can now also advance its internal causal bars with `compute=False`; this allows strided offline replay without skipping state updates or materializing every embedding.
+
 ### Phase 1B — counterfactual outcome resolver
 
 Implemented in `truetrade/scalper/counterfactual.py`.
@@ -93,10 +95,49 @@ Every eligible anchor can now be evaluated independently of the policy for both 
 
 This means future learning no longer has to depend only on trades the current policy chose to execute. FLAT/rejected states can also become training evidence after their future path resolves.
 
+### Phase 1C — offline episode builder and replay parity audit
+
+Implemented in:
+
+- `truetrade/scalper/offline_episodes.py`;
+- `scripts/bbyg_v4_build_episodes.py`;
+- `tests/test_v4_offline_episodes.py`.
+
+The builder now:
+
+- replays persisted MT5 ticks through the exact same v4 state encoder;
+- advances all intermediate ticks causally while only materializing states at the frozen stride;
+- resets state across market gaps larger than the configured boundary;
+- refuses counterfactual horizons that cross a market gap;
+- computes policy-independent LONG and SHORT future outcomes;
+- persists FLAT/rejected-style `MarketEpisode` evidence before any policy exists;
+- stores LONG/SHORT net R, MFE, MAE and artificial-dopamine rewards;
+- uses a vectorized/chunked future-path resolver for offline scale;
+- writes a frozen dataset signature based on the encoder schema and outcome contract;
+- writes a deterministic binary SHA-256 episode digest;
+- independently replays the same source ticks during audit and requires exact signature, digest and episode-count parity.
+
+The CLI is deliberately write-safe. Dataset replacement requires both `--build` and `--yes-replace`. Audit mode performs no episode writes.
+
+Example local build:
+
+```powershell
+python -m scripts.bbyg_v4_build_episodes --build --yes-replace
+```
+
+Independent parity replay:
+
+```powershell
+python -m scripts.bbyg_v4_build_episodes --audit
+```
+
+A parity audit failure is a hard stop before model training.
+
 ### Tests
 
 - `tests/test_v4_memory_thesis.py`
 - `tests/test_v4_state_counterfactual.py`
+- `tests/test_v4_offline_episodes.py`
 - reward bounds;
 - similarity recall;
 - delayed episode outcome resolution;
@@ -106,20 +147,25 @@ This means future learning no longer has to depend only on trades the current po
 - deterministic multi-timescale state encoding;
 - strict chronological tick enforcement;
 - counterfactual LONG/SHORT resolution from one identical future path;
-- first-strictly-later executable entry semantics.
+- first-strictly-later executable entry semantics;
+- deterministic offline dataset digest;
+- exact second-replay parity;
+- gap segmentation;
+- digest sensitivity to source-path changes.
 
 ## Next implementation order
 
-### Phase 1C — offline episode builder and replay parity audit
+### Phase 1D — dataset diagnostics and frozen research split
 
 Next:
 
-- replay persisted MT5 ticks through the exact v4 state encoder;
-- sample eligible states at a frozen stride;
-- persist `MarketEpisode` rows;
-- resolve LONG and SHORT counterfactual outcomes;
-- verify a second independent replay produces byte/equality-equivalent state vectors at the same timestamps;
-- produce regime/coverage/reward diagnostics before any model training.
+- run Phase 1C against the real persisted XAUUSD tick database;
+- require exact build/audit parity;
+- profile regime coverage and reward distributions;
+- inspect directional imbalance and pathological reward tails;
+- freeze chronological train / calibration / validation boundaries;
+- persist a dataset manifest containing tick range, episode count, signature and digest;
+- reject model training if coverage or parity gates fail.
 
 ### Phase 2 — thesis coordinator
 
