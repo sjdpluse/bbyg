@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
-import math
-from pathlib import Path
 
 import numpy as np
 
@@ -46,6 +44,7 @@ class BaselineSettings:
     calibration_day: str = "2026-09-23"
     diagnostic_day: str = "2026-09-24"
     minimum_training_margin: float = 0.10
+    minimum_training_samples: int = 10_000
     memory_max_prototypes: int = 2048
     memory_k: int = 16
     linear_iterations: int = 180
@@ -54,6 +53,8 @@ class BaselineSettings:
     def __post_init__(self) -> None:
         if self.minimum_training_margin < 0:
             raise ValueError("minimum_training_margin must be non-negative")
+        if self.minimum_training_samples < 100:
+            raise ValueError("minimum_training_samples must be >=100")
         if self.memory_max_prototypes < 64 or self.memory_k < 1:
             raise ValueError("invalid memory settings")
         if self.memory_k > self.memory_max_prototypes:
@@ -109,14 +110,6 @@ def _regime_prior(train: EpisodeMatrix, train_mask: np.ndarray, target: EpisodeM
     return np.asarray([mapping.get(str(r), global_prior) for r in target.regime], dtype=np.float64)
 
 
-def _fit_linear(train: EpisodeMatrix, train_mask: np.ndarray):
-    scaler = RobustScaler.fit(train.x[train_mask])
-    tx = scaler.transform(train.x[train_mask])
-    y = train.y[train_mask]
-    model = fit_logit(tx, y, iterations=180, balanced=True)
-    return scaler, model, y
-
-
 def _linear_probability(scaler, model, train_y: np.ndarray, target_x: np.ndarray) -> np.ndarray:
     raw = model.probability(scaler.transform(target_x))
     return restore_training_prior(raw, train_y)
@@ -125,7 +118,6 @@ def _linear_probability(scaler, model, train_y: np.ndarray, target_x: np.ndarray
 def _prototype_indices(n: int, cap: int) -> np.ndarray:
     if n <= cap:
         return np.arange(n, dtype=np.int64)
-    # Deterministic chronological coverage rather than random sampling.
     return np.linspace(0, n - 1, cap, dtype=np.int64)
 
 
@@ -199,7 +191,7 @@ def run_v4_baselines(store: ScalperStore, settings: BaselineSettings | None = No
     calibration = load_days(store, [settings.calibration_day])
     diagnostic = load_days(store, [settings.diagnostic_day])
     train_mask = np.abs(train.margin) >= settings.minimum_training_margin
-    if int(train_mask.sum()) < 10_000:
+    if int(train_mask.sum()) < settings.minimum_training_samples:
         raise ValueError(f"insufficient strong-margin training episodes: {int(train_mask.sum())}")
     train_y = train.y[train_mask]
 
@@ -237,6 +229,7 @@ def run_v4_baselines(store: ScalperStore, settings: BaselineSettings | None = No
             "calibration_day": settings.calibration_day,
             "diagnostic_day": settings.diagnostic_day,
             "minimum_training_margin": settings.minimum_training_margin,
+            "minimum_training_samples": settings.minimum_training_samples,
             "memory_max_prototypes": settings.memory_max_prototypes,
             "memory_k": settings.memory_k,
             "linear_iterations": settings.linear_iterations,
