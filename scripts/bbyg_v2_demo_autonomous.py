@@ -74,15 +74,51 @@ def load_training(store: ScalperStore, cutoff_ns: int) -> tuple[np.ndarray, np.n
     return x, y
 
 
-def close_trade(broker: TimeNormalizedDemoMT5Execution, trade: ActiveTrade,
-                tick: Tick, reason: str) -> float:
-    result = broker.close(trade.ticket, 1.0, decision_id("close", tick.ts_ns, trade.side))
+def wait_closed_outcome(broker: TimeNormalizedDemoMT5Execution, identifier: int):
     outcome = None
     for _ in range(12):
-        outcome = broker.closed_outcome(trade.identifier)
+        outcome = broker.closed_outcome(identifier)
         if outcome is not None:
             break
         time.sleep(0.10)
+    return outcome
+
+
+def close_trade(broker: TimeNormalizedDemoMT5Execution, trade: ActiveTrade,
+                tick: Tick, reason: str) -> float:
+    """Close one managed trade, tolerating a broker-SL race without blind retries.
+
+    A broker emergency SL can fill between the runner's reconciliation pass and its
+    software-close request. In that case MT5 rejects the close because the position is
+    already gone. That is a resolved broker outcome, not an execution failure.
+    """
+    fill_price = None
+    try:
+        result = broker.close(trade.ticket, 1.0, decision_id("close", tick.ts_ns, trade.side))
+        fill_price = float(result.fill_price)
+    except ExecutionRejected:
+        current_ticket = broker.position_ticket_by_identifier(trade.identifier)
+        if current_ticket is not None:
+            # The position still exists; this is a real rejection and must not be hidden.
+            raise
+        outcome = wait_closed_outcome(broker, trade.identifier)
+        if outcome is None:
+            raise ExecutionUncertain(
+                f"position {trade.ticket} became absent after close rejection but outcome is not observable"
+            )
+        pnl = float(outcome["net_pnl"])
+        emit(
+            "closed_reconciled",
+            reason=f"{reason}_broker_race",
+            side=trade.side.value,
+            ticket=trade.ticket,
+            fill_price=None,
+            net_pnl_usd=pnl,
+            outcome=outcome,
+        )
+        return pnl
+
+    outcome = wait_closed_outcome(broker, trade.identifier)
     if outcome is None:
         raise ExecutionUncertain(f"closed position outcome not observable for {trade.ticket}")
     pnl = float(outcome["net_pnl"])
@@ -91,7 +127,7 @@ def close_trade(broker: TimeNormalizedDemoMT5Execution, trade: ActiveTrade,
         reason=reason,
         side=trade.side.value,
         ticket=trade.ticket,
-        fill_price=result.fill_price,
+        fill_price=fill_price,
         net_pnl_usd=pnl,
     )
     return pnl
@@ -167,6 +203,7 @@ def main() -> None:
     realized_pnl = 0.0
     aggregate_emergency_risk = 0.0
     deadline = time.monotonic() + args.hours * 3600.0
+    uncertain_state = False
 
     try:
         broker.connect()
@@ -216,23 +253,43 @@ def main() -> None:
             tick_no += 1
             segment_tick_no += 1
 
-            # Reconcile every managed ticket against MT5 before making new writes.
-            broker_positions = {p.position_id: p for p in broker.positions()}
+            # Reconcile every managed position by stable identifier. Ticket changes and
+            # broker-side emergency-stop fills are handled without treating them as fatal.
             for ticket in list(active):
-                if ticket not in broker_positions:
-                    trade = active.pop(ticket)
-                    outcome = broker.closed_outcome(trade.identifier)
+                trade = active.get(ticket)
+                if trade is None:
+                    continue
+                current_ticket = broker.position_ticket_by_identifier(trade.identifier)
+                if current_ticket is None:
+                    outcome = wait_closed_outcome(broker, trade.identifier)
                     if outcome is None:
-                        raise ExecutionUncertain(f"managed position disappeared without observable outcome: {ticket}")
+                        raise ExecutionUncertain(
+                            f"managed position disappeared without observable outcome: {ticket}"
+                        )
+                    active.pop(ticket, None)
                     pnl = float(outcome["net_pnl"])
                     realized_pnl += pnl
                     trades_closed += 1
-                    emit("broker_closed", ticket=ticket, net_pnl_usd=pnl,
-                         session_net_pnl_usd=realized_pnl)
+                    emit(
+                        "broker_closed",
+                        ticket=ticket,
+                        side=trade.side.value,
+                        net_pnl_usd=pnl,
+                        session_net_pnl_usd=realized_pnl,
+                        outcome=outcome,
+                    )
+                elif current_ticket != ticket:
+                    active.pop(ticket, None)
+                    trade.ticket = current_ticket
+                    active[current_ticket] = trade
+                    emit("position_ticket_reconciled", old_ticket=ticket,
+                         new_ticket=current_ticket, identifier=trade.identifier)
 
-            # Independent TP/SL/horizon for every open position.
+            # Independent target/stop/horizon lifecycle for every open position.
             for ticket in list(active):
-                trade = active[ticket]
+                trade = active.get(ticket)
+                if trade is None:
+                    continue
                 reason = None
                 if trade.side is Side.LONG:
                     if tick.bid <= trade.stop:
@@ -248,25 +305,27 @@ def main() -> None:
                     reason = "strategy_horizon"
                 if reason is not None:
                     pnl = close_trade(broker, trade, tick, reason)
+                    active.pop(trade.ticket, None)
+                    active.pop(ticket, None)
                     realized_pnl += pnl
                     trades_closed += 1
-                    active.pop(ticket, None)
 
-            # Recalculate current aggregate emergency-stop risk conservatively from broker settings.
-            per_order_risk = None
+            # Conservative aggregate emergency-stop risk estimate.
             if active:
                 info = broker._symbol_info()
-                sample_side = next(iter(active.values())).side
-                expected = tick.ask if sample_side is Side.LONG else tick.bid
-                _, per_order_risk = broker._risk_checked_stop(sample_side, args.size, expected, info)
-                aggregate_emergency_risk = per_order_risk * len(active)
+                risks = []
+                for trade in active.values():
+                    expected = tick.ask if trade.side is Side.LONG else tick.bid
+                    _, risk = broker._risk_checked_stop(trade.side, args.size, expected, info)
+                    risks.append(float(risk))
+                aggregate_emergency_risk = float(sum(risks))
             else:
                 aggregate_emergency_risk = 0.0
 
             while entry_times and tick.ts_ns - entry_times[0] >= 1_000_000_000:
                 entry_times.popleft()
 
-            # Execute queued signals on the first later tick, subject to independent portfolio guards.
+            # Every selected signal can become its own position on the next executable tick.
             queued = len(pending)
             for _ in range(queued):
                 signal = pending.popleft()
@@ -287,9 +346,13 @@ def main() -> None:
                 expected = tick.ask if signal.side is Side.LONG else tick.bid
                 _, candidate_risk = broker._risk_checked_stop(signal.side, args.size, expected, info)
                 if aggregate_emergency_risk + candidate_risk > args.max_aggregate_emergency_risk_usd + 1e-9:
-                    emit("entry_blocked", reason="aggregate_risk_cap",
-                         open_positions=len(active), aggregate_risk_usd=aggregate_emergency_risk,
-                         candidate_risk_usd=candidate_risk)
+                    emit(
+                        "entry_blocked",
+                        reason="aggregate_risk_cap",
+                        open_positions=len(active),
+                        aggregate_risk_usd=aggregate_emergency_risk,
+                        candidate_risk_usd=candidate_risk,
+                    )
                     continue
 
                 opened = broker.open(signal.side, args.size, decision_id("open", tick.ts_ns, signal.side))
@@ -365,24 +428,35 @@ def main() -> None:
         emit("execution_rejected", error=str(exc))
         raise SystemExit(2) from None
     except ExecutionUncertain as exc:
+        uncertain_state = True
         emit("execution_uncertain", error=str(exc), instruction="Inspect MT5 before any retry")
         raise SystemExit(3) from None
     finally:
-        if broker.connected:
+        if broker.connected and not uncertain_state:
             try:
                 fresh = broker._fresh_tick_for_write()
                 for ticket in list(active):
-                    trade = active[ticket]
+                    trade = active.get(ticket)
+                    if trade is None:
+                        continue
                     try:
                         pnl = close_trade(broker, trade, fresh, "session_end")
+                        active.pop(ticket, None)
+                        active.pop(trade.ticket, None)
                         realized_pnl += pnl
                         trades_closed += 1
-                        active.pop(ticket, None)
-                    except Exception as exc:
-                        emit("final_flatten_failed", ticket=ticket, error=str(exc),
+                    except ExecutionRejected as exc:
+                        emit("final_flatten_rejected", ticket=ticket, error=str(exc),
                              instruction="Inspect MT5 manually before restarting")
+                    except ExecutionUncertain as exc:
+                        uncertain_state = True
+                        emit("final_flatten_uncertain", ticket=ticket, error=str(exc),
+                             instruction="Inspect MT5 manually before restarting")
+                        break
             finally:
                 broker.shutdown()
+        elif broker.connected:
+            broker.shutdown()
 
     emit(
         "complete",
@@ -394,6 +468,7 @@ def main() -> None:
         trades_closed=trades_closed,
         remaining_open_positions=len(active),
         session_net_pnl_usd=realized_pnl,
+        uncertain_state=uncertain_state,
     )
 
 
