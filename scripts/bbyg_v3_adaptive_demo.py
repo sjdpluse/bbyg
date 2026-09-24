@@ -63,6 +63,10 @@ def main() -> None:
     parser.add_argument("--hours", type=float, default=3.0)
     parser.add_argument("--threshold", type=float, default=0.56)
     parser.add_argument("--exit-reversal-threshold", type=float, default=0.58)
+    parser.add_argument("--min-exit-age-seconds", type=float, default=12.0)
+    parser.add_argument("--model-reversal-confirmations", type=int, default=3)
+    parser.add_argument("--technical-reversal-confirmations", type=int, default=3)
+    parser.add_argument("--technical-reversal-score", type=int, default=4)
     parser.add_argument("--min-technical-score", type=int, default=3)
     parser.add_argument("--min-trend-efficiency", type=float, default=0.12)
     parser.add_argument("--min-velocity", type=float, default=0.05)
@@ -102,6 +106,14 @@ def main() -> None:
         raise SystemExit("--threshold must be in (0.50, 0.80]")
     if not 0.50 < args.exit_reversal_threshold <= 0.80:
         raise SystemExit("--exit-reversal-threshold must be in (0.50, 0.80]")
+    if not 0 <= args.min_exit_age_seconds <= 300:
+        raise SystemExit("--min-exit-age-seconds must be 0..300")
+    if not 1 <= args.model_reversal_confirmations <= 20:
+        raise SystemExit("--model-reversal-confirmations must be 1..20")
+    if not 1 <= args.technical_reversal_confirmations <= 20:
+        raise SystemExit("--technical-reversal-confirmations must be 1..20")
+    if not 1 <= args.technical_reversal_score <= 4:
+        raise SystemExit("--technical-reversal-score must be 1..4")
     if not 1 <= args.min_technical_score <= 4:
         raise SystemExit("--min-technical-score must be 1..4")
     if not 1 <= args.entries_per_signal <= 10:
@@ -134,6 +146,8 @@ def main() -> None:
     pending: deque[PendingAdaptiveEntry] = deque()
     active: dict[str, ActiveTrade] = {}
     entry_times: deque[int] = deque()
+    model_reversal_streak: dict[int, int] = {}
+    technical_reversal_streak: dict[int, int] = {}
 
     tick_no = 0
     segment_tick_no = 0
@@ -177,6 +191,10 @@ def main() -> None:
             threshold=args.threshold,
             min_technical_score=args.min_technical_score,
             entries_per_signal=args.entries_per_signal,
+            min_exit_age_seconds=args.min_exit_age_seconds,
+            model_reversal_confirmations=args.model_reversal_confirmations,
+            technical_reversal_confirmations=args.technical_reversal_confirmations,
+            technical_reversal_score=args.technical_reversal_score,
             start_equity=start_equity,
             symbol=broker.symbol,
         )
@@ -226,6 +244,8 @@ def main() -> None:
                     if outcome is None:
                         raise ExecutionUncertain(f"position vanished without outcome: {ticket}")
                     active.pop(ticket, None)
+                    model_reversal_streak.pop(trade.identifier, None)
+                    technical_reversal_streak.pop(trade.identifier, None)
                     pnl = float(outcome["net_pnl"])
                     realized_pnl += pnl
                     trades_closed += 1
@@ -244,7 +264,10 @@ def main() -> None:
                 last_confidence = max(last_p_long, 1.0 - last_p_long)
                 last_fundamental = fundamental.snapshot()
 
-            # Model-driven and profit-protection exits.
+            # Exit policy:
+            # 1) hard software loss cut and already-earned profit protection may act immediately;
+            # 2) model/technical reversals need both a minimum position age and persistent confirmation.
+            # This prevents one noisy 4-tick score from liquidating an entire signal fanout.
             for ticket in list(active):
                 trade = active.get(ticket)
                 if trade is None:
@@ -259,22 +282,80 @@ def main() -> None:
                     trailing_distance_spreads=args.trailing_distance_spreads,
                 )
                 fav = favorable_spreads(trade, tick)
+                age_seconds = max(0.0, (tick.ts_ns - trade.opened_ns) / 1_000_000_000.0)
                 reason = None
+                exit_context: dict[str, object] = {}
+
                 if trade.algo_floor_spreads is not None and fav <= trade.algo_floor_spreads:
                     reason = "algorithmic_profit_protection"
+                    exit_context = {
+                        "protection_stage": trade.protection_stage,
+                        "floor_spreads": trade.algo_floor_spreads,
+                        "peak_favorable_spreads": trade.peak_favorable_spreads,
+                    }
                 elif fav <= -args.algorithmic_loss_cut_spreads:
                     reason = "algorithmic_loss_cut"
+                    exit_context = {"loss_cut_spreads": args.algorithmic_loss_cut_spreads}
                 elif new_score and last_p_long is not None:
                     directional_p = last_p_long if trade.side is Side.LONG else 1.0 - last_p_long
-                    if 1.0 - directional_p >= args.exit_reversal_threshold:
-                        reason = "adaptive_model_reversal"
-                    elif last_technical and last_technical.ready:
-                        if last_technical.opposite_score(trade.side) >= 3 and directional_p < 0.55:
-                            reason = "technical_reversal"
+                    opposite_p = 1.0 - directional_p
+                    tech_same = 0
+                    tech_opposite = 0
+                    tech_ready = bool(last_technical and last_technical.ready)
+                    if tech_ready:
+                        tech_same = last_technical.score_for(trade.side)
+                        tech_opposite = last_technical.opposite_score(trade.side)
+
+                    model_reverse_now = (
+                        opposite_p >= args.exit_reversal_threshold
+                        and (not tech_ready or tech_opposite >= tech_same)
+                    )
+                    technical_reverse_now = (
+                        tech_ready
+                        and tech_opposite >= args.technical_reversal_score
+                        and tech_opposite > tech_same
+                        and directional_p < 0.50
+                    )
+
+                    if model_reverse_now:
+                        model_reversal_streak[trade.identifier] = model_reversal_streak.get(trade.identifier, 0) + 1
+                    else:
+                        model_reversal_streak[trade.identifier] = 0
+                    if technical_reverse_now:
+                        technical_reversal_streak[trade.identifier] = technical_reversal_streak.get(trade.identifier, 0) + 1
+                    else:
+                        technical_reversal_streak[trade.identifier] = 0
+
+                    if age_seconds >= args.min_exit_age_seconds:
+                        if model_reversal_streak[trade.identifier] >= args.model_reversal_confirmations:
+                            reason = "confirmed_adaptive_model_reversal"
+                        elif technical_reversal_streak[trade.identifier] >= args.technical_reversal_confirmations:
+                            reason = "confirmed_technical_reversal"
+
+                    exit_context = {
+                        "directional_probability": directional_p,
+                        "opposite_probability": opposite_p,
+                        "technical_same_score": tech_same,
+                        "technical_opposite_score": tech_opposite,
+                        "model_reversal_streak": model_reversal_streak.get(trade.identifier, 0),
+                        "technical_reversal_streak": technical_reversal_streak.get(trade.identifier, 0),
+                    }
+
                 if reason is not None:
+                    emit(
+                        "exit_decision",
+                        ticket=trade.ticket,
+                        side=trade.side.value,
+                        reason=reason,
+                        age_seconds=age_seconds,
+                        favorable_spreads=fav,
+                        **exit_context,
+                    )
                     pnl = close_trade(broker, trade, tick, reason)
                     active.pop(ticket, None)
                     active.pop(trade.ticket, None)
+                    model_reversal_streak.pop(trade.identifier, None)
+                    technical_reversal_streak.pop(trade.identifier, None)
                     realized_pnl += pnl
                     trades_closed += 1
 
@@ -391,6 +472,8 @@ def main() -> None:
                     copy_no=item.copy_no,
                 )
                 active[trade.ticket] = trade
+                model_reversal_streak[trade.identifier] = 0
+                technical_reversal_streak[trade.identifier] = 0
                 trades_opened += 1
                 entry_times.append(tick.ts_ns)
                 emit(
@@ -442,6 +525,12 @@ def main() -> None:
                     trades_closed=trades_closed,
                     realized_pnl_usd=realized_pnl,
                     equity=broker.account_equity(),
+                    max_model_reversal_streak=max(model_reversal_streak.values(), default=0),
+                    max_technical_reversal_streak=max(technical_reversal_streak.values(), default=0),
+                    exit_grace_positions=sum(
+                        1 for t in active.values()
+                        if (tick.ts_ns - t.opened_ns) / 1_000_000_000.0 < args.min_exit_age_seconds
+                    ),
                 )
                 last_status = now
 
@@ -467,6 +556,8 @@ def main() -> None:
                         pnl = close_trade(broker, trade, fresh, "session_end")
                         active.pop(ticket, None)
                         active.pop(trade.ticket, None)
+                        model_reversal_streak.pop(trade.identifier, None)
+                        technical_reversal_streak.pop(trade.identifier, None)
                         realized_pnl += pnl
                         trades_closed += 1
                     except Exception as exc:
