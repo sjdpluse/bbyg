@@ -1,0 +1,62 @@
+{
+  "protocol": "bbyg_v4_research_v1",
+  "created_utc_date": "2026-09-24",
+  "execution_authorized": false,
+  "dataset": {
+    "manifest": "research/bbyg_v4_dataset_v1.json",
+    "dataset_signature": "e33aab1d8981272729c3ae5774b31f77f10d7856620b8d215615fbbc3889d28a",
+    "dataset_digest": "be768cf3bdd3a777be1be4248817e14887bcbe2d6c388c242bdab2d87e390baa",
+    "episode_count": 179077,
+    "feature_dimensions": 47
+  },
+  "observed_days": {
+    "train": ["2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21", "2026-09-22"],
+    "calibration": ["2026-09-23"],
+    "diagnostic_only": ["2026-09-24"],
+    "excluded_partial": ["2026-09-15", "2026-09-20"]
+  },
+  "pristine_validation": {
+    "strictly_after_utc_date": "2026-09-24",
+    "minimum_full_eligible_days": 2,
+    "minimum_episodes_per_day": 20000,
+    "minimum_total_episodes": 40000,
+    "latest_partial_day_must_be_excluded": true,
+    "peek_before_freeze_forbidden": true
+  },
+  "direction_target": {
+    "definition": "LONG iff counterfactual_long_reward > counterfactual_short_reward",
+    "minimum_absolute_reward_margin_for_training": 0.10,
+    "ties_and_weak_margins_may_be_scored_but_are_excluded_from_directional_training"
+  },
+  "phase_1e_baselines": {
+    "constant_prior": true,
+    "regime_prior": true,
+    "linear_logit": true,
+    "cosine_episodic_memory": true,
+    "linear_plus_memory_fixed_average": true,
+    "memory_max_prototypes": 2048,
+    "memory_k": 16,
+    "linear_iterations": 180,
+    "seed": 731022
+  },
+  "calibration_reporting": {
+    "confidence_thresholds": [0.55, 0.60],
+    "report_binary_metrics": true,
+    "report_selected_counterfactual_reward": true,
+    "report_selected_positive_reward_fraction": true,
+    "economic_proxy_is_not_execution_qualification": true
+  },
+  "promotion": {
+    "calibration_is_for_model_selection_only": true,
+    "diagnostic_day_is_never_pristine_validation": true,
+    "pristine_validation_must_be_future_and_untouched": true,
+    "no_model_may_authorize_mt5_execution": true,
+    "connectome_or_memory_component_must_beat_simpler_matched_baselines_on_future_validation": true
+  },
+  "notes": [
+    "2026-09-24 is partial and its reward diagnostics have already been inspected, therefore it is diagnostic-only and cannot serve as pristine validation.",
+    "2026-09-23 has also been observed repeatedly in earlier BBYG research and is calibration-only.",
+    "Future validation begins strictly after 2026-09-24 and must remain untouched until the model family and thresholds are frozen.",
+    "The unconditional mean LONG and SHORT rewards in dataset diagnostics are both negative; v4 must demonstrate conditional predictive information rather than rely on a directional prior."
+  ]
+}
