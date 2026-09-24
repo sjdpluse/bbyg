@@ -47,37 +47,79 @@ The repository **does contain PPO** under `truetrade/rl/ppo.py` and tests for it
 - repeated exit confirmation requirement;
 - no single prediction flip can create a valid thesis transition by itself.
 
+### Phase 1A — causal multi-timescale state encoder
+
+Implemented in `truetrade/scalper/state_encoder.py`.
+
+The encoder now joins, causally and incrementally:
+
+- existing tick microstructure;
+- partial/current 1-second, 5-second and 60-second bars;
+- returns;
+- EMA 9 / EMA 21 distances and separation;
+- EMA slope;
+- RSI-14;
+- ATR-14;
+- realized volatility;
+- local range position;
+- breakout distance;
+- relative volume;
+- UTC cyclical time features;
+- spread fraction;
+- optional execution latency/slippage/failure context.
+
+The state encoder also classifies a coarse causal regime:
+
+- `quiet`;
+- `range`;
+- `trend_up`;
+- `trend_down`;
+- `shock`.
+
+Important parity rule: replay and live must both feed sequential ticks through the same encoder. Missing buckets are not fabricated and the current partial bar contains only observations already received.
+
+### Phase 1B — counterfactual outcome resolver
+
+Implemented in `truetrade/scalper/counterfactual.py`.
+
+Every eligible anchor can now be evaluated independently of the policy for both hypothetical directions:
+
+- executable LONG from the first strictly later ask;
+- executable SHORT from the first strictly later bid;
+- fixed causal future horizon;
+- MFE and MAE in R units;
+- terminal net R after explicit spread-equivalent cost;
+- bounded reward using the same artificial-dopamine reward components as experiential memory.
+
+This means future learning no longer has to depend only on trades the current policy chose to execute. FLAT/rejected states can also become training evidence after their future path resolves.
+
 ### Tests
 
 - `tests/test_v4_memory_thesis.py`
+- `tests/test_v4_state_counterfactual.py`
 - reward bounds;
 - similarity recall;
 - delayed episode outcome resolution;
 - persistent entry evidence;
 - persistent/aged reversal exit;
-- memory disagreement blocking.
+- memory disagreement blocking;
+- deterministic multi-timescale state encoding;
+- strict chronological tick enforcement;
+- counterfactual LONG/SHORT resolution from one identical future path;
+- first-strictly-later executable entry semantics.
 
 ## Next implementation order
 
-### Phase 1A — market state encoder
+### Phase 1C — offline episode builder and replay parity audit
 
-Create one causal state vector joining:
+Next:
 
-- existing tick microstructure;
-- 1s / 5s / 1m bars;
-- EMA slope and separation;
-- RSI;
-- ATR / realized volatility;
-- local structure / breakout distance;
-- spread regime;
-- session / time features;
-- execution-quality context.
-
-The encoder must be deterministic and replay/live-parity tested.
-
-### Phase 1B — counterfactual episode resolver
-
-Every eligible state, including FLAT decisions, receives future counterfactual LONG and SHORT rewards using executable bid/ask paths and costs. This prevents learning only from trades the current policy happened to execute.
+- replay persisted MT5 ticks through the exact v4 state encoder;
+- sample eligible states at a frozen stride;
+- persist `MarketEpisode` rows;
+- resolve LONG and SHORT counterfactual outcomes;
+- verify a second independent replay produces byte/equality-equivalent state vectors at the same timestamps;
+- produce regime/coverage/reward diagnostics before any model training.
 
 ### Phase 2 — thesis coordinator
 
