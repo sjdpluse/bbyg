@@ -1,0 +1,63 @@
+{
+  "protocol": "bbyg_forward_confirmation_v2_all_anchor",
+  "created_utc_date": "2026-09-24",
+  "v1_freeze_date": "2026-09-22",
+  "v2_pristine_after_utc_date": "2026-09-23",
+  "execution_authorized": false,
+  "commission_verified": false,
+  "signal_universe": "all_causal_stride_anchors",
+  "stride": 4,
+  "feature_warmup_ticks": 96,
+  "model": {
+    "architecture": "linear",
+    "probability_variant": "raw_balanced",
+    "recent_train_samples": 20000,
+    "minimum_train_samples": 10000,
+    "iterations": 140,
+    "seed": 731022
+  },
+  "calibration": {
+    "reference_labeled_samples": 5000,
+    "thresholds": [0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58, 0.59, 0.60],
+    "minimum_trades": 100,
+    "minimum_profit_factor": 1.05,
+    "use_all_causal_anchors_in_calibration_window": true,
+    "require_full_600_tick_horizon_before_validation_start": true
+  },
+  "trade_geometry": {
+    "profit_spreads": 1.6,
+    "loss_spreads": 1.4,
+    "label_extra_cost_spreads": 0.2,
+    "stop_reference": "entry",
+    "max_lookahead_ticks": 600,
+    "max_entry_delay_seconds": 5.0
+  },
+  "portfolio_policy": {
+    "max_positions": 6,
+    "max_same_side_positions": 4,
+    "max_entries_per_second": 4,
+    "cooldown_ms": 0,
+    "max_entry_delay_seconds": 5.0,
+    "max_gap_seconds": 300.0
+  },
+  "economic_cost": {
+    "name": "base_0p20",
+    "slippage_per_side_spreads": 0.05,
+    "commission_roundturn_spreads": 0.10,
+    "total_extra_cost_spreads": 0.20
+  },
+  "validation": {
+    "minimum_day_anchors": 3000,
+    "exclude_latest_stored_utc_date_by_default": true,
+    "use_all_causal_anchors": true
+  },
+  "notes": [
+    "Training labels remain resolved first-passage labels because supervised fitting requires an observed target.",
+    "Calibration and validation signal generation use every eligible causal stride anchor, not only anchors that later resolved into a stored label.",
+    "This removes future-resolvability selection from the economic signal universe.",
+    "The latest stored UTC date is excluded by default to avoid scoring a partial trading day.",
+    "The 2026-09-23 v1 result was observed before this v2 protocol was written, so v2 scoring of 2026-09-23 is a diagnostic cross-check rather than a pristine v2 forward day.",
+    "The first pristine v2 forward day is strictly after 2026-09-23.",
+    "This protocol never authorizes demo or live execution by itself."
+  ]
+}
